@@ -28,7 +28,7 @@ pub enum PageState {
         state: BrowsePageUIState,
     },
     Queue {
-        scroll_offset: usize,
+        state: TableState,
     },
     CommandHelp {
         scroll_offset: usize,
@@ -241,8 +241,8 @@ impl PageState {
                 }
             },
             Self::Lyrics { .. } => None,
+            Self::Queue { state } => Some(MutableWindowState::Table(state)),
             Self::CommandHelp { scroll_offset }
-            | Self::Queue { scroll_offset }
             | Self::Logs { scroll_offset } => Some(MutableWindowState::Scroll(scroll_offset)),
         }
     }

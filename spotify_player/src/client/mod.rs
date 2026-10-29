@@ -38,10 +38,7 @@ pub use request::*;
 use serde::Deserialize;
 pub(crate) use spotify::{PkceWebApiClient, WebApiClient};
 
-fn patch_missing_track_external_ids(response: &mut serde_json::Value) {
-    let Some(item) = response.get_mut("item") else {
-        return;
-    };
+fn patch_track_external_ids(item: &mut serde_json::Value) {
     if item.get("type").and_then(serde_json::Value::as_str) != Some("track")
         || item.get("external_ids").is_some()
     {
@@ -55,6 +52,26 @@ fn patch_missing_track_external_ids(response: &mut serde_json::Value) {
     }
 }
 
+fn patch_missing_track_external_ids(response: &mut serde_json::Value) {
+    if let Some(item) = response.get_mut("item") {
+        patch_track_external_ids(item);
+    }
+}
+
+fn patch_missing_queue_external_ids(response: &mut serde_json::Value) {
+    if let Some(item) = response.get_mut("currently_playing") {
+        patch_track_external_ids(item);
+    }
+    if let Some(queue) = response
+        .get_mut("queue")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for item in queue {
+            patch_track_external_ids(item);
+        }
+    }
+}
+
 fn parse_current_playback_response(
     text: &str,
 ) -> Result<Option<rspotify::model::CurrentPlaybackContext>> {
@@ -65,6 +82,12 @@ fn parse_current_playback_response(
     let mut response = serde_json::from_str(text)?;
     patch_missing_track_external_ids(&mut response);
     Ok(Some(serde_json::from_value(response)?))
+}
+
+fn parse_current_user_queue_response(text: &str) -> Result<rspotify::model::CurrentUserQueue> {
+    let mut response = serde_json::from_str(text)?;
+    patch_missing_queue_external_ids(&mut response);
+    Ok(serde_json::from_value(response)?)
 }
 
 /// The application's Spotify client
@@ -585,58 +608,76 @@ impl AppClient {
             ClientRequest::GetContext(context) => {
                 let uri = context.uri();
                 // Liked tracks must always be refreshed to keep user_data.saved_tracks in sync.
-                let cache_miss = uri != USER_LIKED_TRACKS_URI
-                    && !state.data.read().caches.context.contains_key(&uri);
                 let is_liked = uri == USER_LIKED_TRACKS_URI;
-                if cache_miss || is_liked {
-                    let ctx = match context {
-                        ContextId::Playlist(playlist_id) => {
-                            self.playlist_context(playlist_id).await?
-                        }
-                        ContextId::Album(album_id) => self.album_context(album_id).await?,
-                        ContextId::Artist(artist_id) => self.artist_context(artist_id).await?,
-                        ContextId::Tracks(tracks_id) => match tracks_id.uri.as_str() {
-                            USER_TOP_TRACKS_URI => Context::Tracks {
-                                tracks: self.current_user_top_tracks().await?,
-                                desc: "User's top tracks".to_string(),
-                            },
-                            USER_RECENTLY_PLAYED_TRACKS_URI => Context::Tracks {
-                                tracks: self.current_user_recently_played_tracks().await?,
-                                desc: "User's recently played tracks".to_string(),
-                            },
-                            USER_LIKED_TRACKS_URI => {
-                                let tracks = self.current_user_saved_tracks().await?;
-                                let tracks_hm = tracks
-                                    .iter()
-                                    .map(|t| (t.id.uri(), t.clone()))
-                                    .collect::<HashMap<_, _>>();
-                                store_data_into_file_cache(
-                                    FileCacheKey::SavedTracks,
-                                    &config::get_config().cache_folder,
-                                    &tracks_hm,
-                                )
-                                .context("store user's saved tracks into the cache folder")?;
-                                state.data.write().user_data.saved_tracks = tracks_hm;
-                                Context::Tracks {
-                                    tracks,
-                                    desc: "User's liked tracks".to_string(),
-                                }
+                let should_fetch = {
+                    let mut data = state.data.write();
+                    let cache_miss = !is_liked && !data.caches.context.contains_key(&uri);
+                    (cache_miss || is_liked) && data.caches.begin_context_fetch(&uri)
+                };
+                if should_fetch {
+                    let fetch_res: Result<Context> = async {
+                        let ctx = match context {
+                            ContextId::Playlist(playlist_id) => {
+                                self.playlist_context(playlist_id).await?
                             }
-                            u if u.starts_with("radio:") => Context::Tracks {
-                                tracks: self.radio_tracks(u["radio:".len()..].to_string()).await?,
-                                desc: tracks_id.kind.clone(),
+                            ContextId::Album(album_id) => self.album_context(album_id).await?,
+                            ContextId::Artist(artist_id) => self.artist_context(artist_id).await?,
+                            ContextId::Tracks(tracks_id) => match tracks_id.uri.as_str() {
+                                USER_TOP_TRACKS_URI => Context::Tracks {
+                                    tracks: self.current_user_top_tracks().await?,
+                                    desc: "User's top tracks".to_string(),
+                                },
+                                USER_RECENTLY_PLAYED_TRACKS_URI => Context::Tracks {
+                                    tracks: self.current_user_recently_played_tracks().await?,
+                                    desc: "User's recently played tracks".to_string(),
+                                },
+                                USER_LIKED_TRACKS_URI => {
+                                    let tracks = self.current_user_saved_tracks().await?;
+                                    let tracks_hm = tracks
+                                        .iter()
+                                        .map(|t| (t.id.uri(), t.clone()))
+                                        .collect::<HashMap<_, _>>();
+                                    store_data_into_file_cache(
+                                        FileCacheKey::SavedTracks,
+                                        &config::get_config().cache_folder,
+                                        &tracks_hm,
+                                    )
+                                    .context("store user's saved tracks into the cache folder")?;
+                                    state.data.write().user_data.saved_tracks = tracks_hm;
+                                    Context::Tracks {
+                                        tracks,
+                                        desc: "User's liked tracks".to_string(),
+                                    }
+                                }
+                                u if u.starts_with("radio:") => Context::Tracks {
+                                    tracks: self.radio_tracks(u["radio:".len()..].to_string()).await?,
+                                    desc: tracks_id.kind.clone(),
+                                },
+                                uri => anyhow::bail!("unsupported Tracks context: {uri}"),
                             },
-                            uri => anyhow::bail!("unsupported Tracks context: {uri}"),
-                        },
-                        ContextId::Show(show_id) => self.show_context(show_id).await?,
-                    };
+                            ContextId::Show(show_id) => self.show_context(show_id).await?,
+                        };
+                        Ok(ctx)
+                    }
+                    .await;
 
-                    state
-                        .data
-                        .write()
-                        .caches
-                        .context
-                        .insert(uri, ctx, *TTL_CACHE_DURATION);
+                    let mut data = state.data.write();
+                    data.caches.finish_context_fetch(&uri);
+                    let mut ctx = fetch_res?;
+
+                    if let Some(sort_state) = data.user_data.context_sort_orders.get(&uri) {
+                        if let Context::Album { tracks, .. }
+                        | Context::Playlist { tracks, .. }
+                        | Context::Tracks { tracks, .. }
+                        | Context::Artist {
+                            top_tracks: tracks, ..
+                        } = &mut ctx
+                        {
+                            sort_state.apply(tracks);
+                        }
+                    }
+
+                    data.caches.context.insert(uri, ctx, *TTL_CACHE_DURATION);
                 }
             }
             ClientRequest::Search(query) => match self.search(&query).await {
@@ -658,10 +699,44 @@ impl AppClient {
                 let album_context = self.album_context(album_id).await?;
 
                 if let Context::Album { album: _, tracks } = album_context {
-                    for track in tracks {
-                        self.add_item_to_queue(PlayableId::Track(track.id), None)
-                            .await?;
+                    let limit = config::get_config().app_config.tracks_playback_limit.min(50);
+                    for track in tracks.into_iter().take(limit) {
+                        if let Err(err) = self.add_item_to_queue(PlayableId::Track(track.id), None).await {
+                            tracing::warn!("Failed to add track to queue: {err:#}");
+                            break;
+                        }
                     }
+                    if let Ok(queue) = self.current_user_queue2().await {
+                        state.player.write().queue = Some(queue);
+                    }
+                }
+            }
+            ClientRequest::AddPlaylistToQueue(playlist_id) => {
+                let playlist_context = self.playlist_context(playlist_id).await?;
+
+                if let Context::Playlist { tracks, .. } = playlist_context {
+                    let limit = config::get_config().app_config.tracks_playback_limit.min(50);
+                    for track in tracks.into_iter().take(limit) {
+                        if let Err(err) = self.add_item_to_queue(PlayableId::Track(track.id), None).await {
+                            tracing::warn!("Failed to add track to queue: {err:#}");
+                            break;
+                        }
+                    }
+                    if let Ok(queue) = self.current_user_queue2().await {
+                        state.player.write().queue = Some(queue);
+                    }
+                }
+            }
+            ClientRequest::AddTracksToQueue(track_ids) => {
+                let limit = config::get_config().app_config.tracks_playback_limit.min(50);
+                for track_id in track_ids.into_iter().take(limit) {
+                    if let Err(err) = self.add_item_to_queue(PlayableId::Track(track_id), None).await {
+                        tracing::warn!("Failed to add track to queue: {err:#}");
+                        break;
+                    }
+                }
+                if let Ok(queue) = self.current_user_queue2().await {
+                    state.player.write().queue = Some(queue);
                 }
             }
             ClientRequest::DeleteTrackFromPlaylist(playlist_id, track_id) => {
@@ -675,7 +750,7 @@ impl AppClient {
                 self.delete_from_library(state, id).await?;
             }
             ClientRequest::GetCurrentUserQueue => {
-                let queue = self.current_user_queue().await?;
+                let queue = self.current_user_queue2().await?;
                 state.player.write().queue = Some(queue);
             }
             ClientRequest::ReorderPlaylistItems {
@@ -1048,7 +1123,31 @@ impl AppClient {
                     anyhow::bail!("`StartPlayback` request for `tracks` context is not supported")
                 }
             },
-            Playback::URIs(ids, offset) => {
+            Playback::URIs(mut ids, offset) => {
+                let configs = config::get_config();
+                if configs.app_config.device.autoplay {
+                    let tail_seed = match &offset {
+                        None if ids.len() == 1 => ids.first().cloned(),
+                        Some(rspotify::model::Offset::Uri(uri))
+                            if ids.last().is_some_and(|id| id.uri() == *uri) =>
+                        {
+                            ids.last().cloned()
+                        }
+                        _ => None,
+                    };
+                    if let Some(PlayableId::Track(seed_id)) = tail_seed {
+                        let rec_ids = self.autoplay_track_ids(&seed_id).await;
+                        if !rec_ids.is_empty() {
+                            let limit = configs.app_config.tracks_playback_limit.max(2);
+                            let keep_existing = ids.len().min(limit / 2).max(1);
+                            if ids.len() > keep_existing {
+                                ids.drain(0..(ids.len() - keep_existing));
+                            }
+                            let remaining = limit.saturating_sub(ids.len());
+                            ids.extend(rec_ids.into_iter().take(remaining).map(PlayableId::Track));
+                        }
+                    }
+                }
                 self.start_uris_playback(ids, device_id, offset, None)
                     .await?;
             }
@@ -1057,8 +1156,7 @@ impl AppClient {
         Ok(())
     }
 
-    /// Get recommendation (radio) tracks based on a seed
-    pub async fn radio_tracks(&self, seed_uri: String) -> Result<Vec<Track>> {
+    async fn mercury_radio_track_ids(&self, seed_uri: &str) -> Result<Vec<TrackId<'static>>> {
         #[derive(Debug, Deserialize)]
         struct TrackData {
             original_gid: String,
@@ -1101,10 +1199,99 @@ impl AppClient {
         }
 
         // Parse a list consisting of IDs of tracks inside the radio station
-        let track_ids = serde_json::from_slice::<RadioStationResponse>(&response.payload[0])?
-            .tracks
-            .into_iter()
-            .filter_map(|t| TrackId::from_id(t.original_gid).ok());
+        Ok(
+            serde_json::from_slice::<RadioStationResponse>(&response.payload[0])?
+                .tracks
+                .into_iter()
+                .filter_map(|t| TrackId::from_id(t.original_gid).ok().map(TrackId::into_static))
+                .collect(),
+        )
+    }
+
+    /// Retrieve recommended track IDs for autoplay continuation when a single/tail track is played
+    async fn autoplay_track_ids(&self, seed_id: &TrackId<'_>) -> Vec<TrackId<'static>> {
+        let seed_uri = seed_id.uri();
+        let limit = config::get_config()
+            .app_config
+            .tracks_playback_limit
+            .saturating_sub(1)
+            .clamp(1, 49);
+
+        if let Ok(Ok(ids)) = tokio::time::timeout(
+            std::time::Duration::from_millis(1500),
+            self.mercury_radio_track_ids(&seed_uri),
+        )
+        .await
+        {
+            let mut seen = std::collections::HashSet::new();
+            seen.insert(seed_uri.clone());
+            let filtered: Vec<_> = ids
+                .into_iter()
+                .filter(|id| seen.insert(id.uri()))
+                .take(limit)
+                .collect();
+            if !filtered.is_empty() {
+                tracing::info!(
+                    "Autoplay: queued {} radio tracks from Mercury for seed {}",
+                    filtered.len(),
+                    seed_uri
+                );
+                return filtered;
+            }
+        }
+
+        if let Ok(Ok(seed_track)) = tokio::time::timeout(
+            std::time::Duration::from_millis(1500),
+            self.track(seed_id.clone()),
+        )
+        .await
+        {
+            let query = if let Some(artist) = seed_track.artists.first() {
+                format!("artist:\"{}\"", artist.name)
+            } else {
+                seed_track.name.clone()
+            };
+            #[allow(clippy::cast_possible_truncation)]
+            let search_limit = (limit as u32).clamp(1, 50);
+            if let Ok(Ok(rspotify::model::SearchResult::Tracks(page))) = tokio::time::timeout(
+                std::time::Duration::from_millis(1500),
+                self.deref().search(
+                    &query,
+                    rspotify::model::SearchType::Track,
+                    Some(rspotify::model::Market::FromToken),
+                    None,
+                    Some(search_limit),
+                    None,
+                ),
+            )
+            .await
+            {
+                let mut seen = std::collections::HashSet::new();
+                seen.insert(seed_uri.clone());
+                let filtered: Vec<_> = page
+                    .items
+                    .into_iter()
+                    .filter_map(|t| t.id.map(TrackId::into_static))
+                    .filter(|id| seen.insert(id.uri()))
+                    .take(limit)
+                    .collect();
+                if !filtered.is_empty() {
+                    tracing::info!(
+                        "Autoplay: queued {} artist/search tracks for seed {}",
+                        filtered.len(),
+                        seed_uri
+                    );
+                    return filtered;
+                }
+            }
+        }
+
+        Vec::new()
+    }
+
+    /// Get recommendation (radio) tracks based on a seed
+    pub async fn radio_tracks(&self, seed_uri: String) -> Result<Vec<Track>> {
+        let track_ids = self.mercury_radio_track_ids(&seed_uri).await?;
 
         // Retrieve tracks based on IDs
         #[allow(deprecated)]
@@ -1467,15 +1654,58 @@ impl AppClient {
             )
             .await?;
 
-        let tracks = self
-            .all_paging_items(
-                &format!("playlists/{}/items", playlist_id.id()),
-                playlist.items.total as usize,
-            )
-            .await?
-            .into_iter()
+        let cache_folder = &config::get_config().cache_folder;
+        if let Some(tracks) = crate::state::load_playlist_tracks_cache(
+            playlist_id.id(),
+            &playlist.snapshot_id,
+            cache_folder,
+        ) {
+            tracing::info!(
+                "Loaded playlist {} ({} tracks) from disk cache (snapshot_id={})",
+                playlist_uri,
+                tracks.len(),
+                playlist.snapshot_id
+            );
+            return Ok(Context::Playlist {
+                playlist: playlist.into(),
+                tracks,
+            });
+        }
+
+        let initial_items_len = playlist.items.items.len();
+        let total_items = playlist.items.total as usize;
+        let mut tracks = playlist
+            .items
+            .items
+            .iter()
+            .cloned()
             .filter_map(Track::try_from_playlist_item)
             .collect::<Vec<_>>();
+
+        if total_items > initial_items_len {
+            let remaining_items = self
+                .all_paging_items_with_options(
+                    &format!("playlists/{}/items", playlist_id.id()),
+                    total_items,
+                    initial_items_len,
+                    100,
+                )
+                .await?;
+            tracks.extend(
+                remaining_items
+                    .into_iter()
+                    .filter_map(Track::try_from_playlist_item),
+            );
+        }
+
+        if let Err(err) = crate::state::store_playlist_tracks_cache(
+            playlist_id.id(),
+            playlist.snapshot_id.clone(),
+            tracks.clone(),
+            cache_folder,
+        ) {
+            tracing::warn!("Failed to store playlist tracks cache: {err:#}");
+        }
 
         Ok(Context::Playlist {
             playlist: playlist.into(),
@@ -1594,16 +1824,30 @@ impl AppClient {
         Ok(serde_json::from_str(&text)?)
     }
 
-    async fn all_paging_items<T>(&self, base_url: &str, mut count: usize) -> Result<Vec<T>>
+    async fn all_paging_items<T>(&self, base_url: &str, count: usize) -> Result<Vec<T>>
     where
         T: serde::de::DeserializeOwned + std::fmt::Debug,
     {
-        const PAGE_LIMIT: usize = 50;
+        self.all_paging_items_with_options(base_url, count, 0, 50)
+            .await
+    }
+
+    async fn all_paging_items_with_options<T>(
+        &self,
+        base_url: &str,
+        mut count: usize,
+        initial_offset: usize,
+        page_limit: usize,
+    ) -> Result<Vec<T>>
+    where
+        T: serde::de::DeserializeOwned + std::fmt::Debug,
+    {
         const MAX_PARALLEL: usize = 4;
 
         let mut all_items = Vec::new();
-        let mut offset = 0;
-        let mut n_jobs = 1;
+        let mut offset = initial_offset;
+        // When total count is already known (`count > 0`), use MAX_PARALLEL immediately
+        let mut n_jobs = if count > 0 { MAX_PARALLEL } else { 1 };
 
         // if count is 0 (i.e., unknown), set it to usize::MAX to fetch until no more items
         if count == 0 {
@@ -1611,13 +1855,13 @@ impl AppClient {
         }
 
         while offset < count {
-            n_jobs = std::cmp::min(n_jobs, (count - offset).div_ceil(PAGE_LIMIT));
+            n_jobs = std::cmp::min(n_jobs, (count - offset).div_ceil(page_limit));
 
             let mut futures = Vec::with_capacity(n_jobs);
 
             for i in 0..n_jobs {
-                let current_offset = offset + i * PAGE_LIMIT;
-                let limit_str = PAGE_LIMIT.to_string();
+                let current_offset = offset + i * page_limit;
+                let limit_str = page_limit.to_string();
                 let offset_str = current_offset.to_string();
 
                 futures.push(async move {
@@ -1635,7 +1879,7 @@ impl AppClient {
 
             let mut found_partial_page = false;
             for mut page in results {
-                if page.items.len() < PAGE_LIMIT {
+                if page.items.len() < page_limit {
                     found_partial_page = true;
                 }
                 all_items.append(&mut page.items);
@@ -1645,7 +1889,7 @@ impl AppClient {
                 break;
             }
 
-            offset += n_jobs * PAGE_LIMIT;
+            offset += n_jobs * page_limit;
             // gradually increase the number of parallel jobs, but do not exceed MAX_PARALLEL
             n_jobs = std::cmp::min(n_jobs + 1, MAX_PARALLEL);
         }
@@ -1659,6 +1903,14 @@ impl AppClient {
         let params = Query::from([("additional_types", "track,episode")]);
         let text = self.api_client.api_get("me/player", &params).await?;
         parse_current_playback_response(&text)
+    }
+
+    pub async fn current_user_queue2(&self) -> Result<rspotify::model::CurrentUserQueue> {
+        let text = self
+            .api_client
+            .api_get("me/player/queue", &Query::new())
+            .await?;
+        parse_current_user_queue_response(&text)
     }
 
     /// Retrieve the latest playback state
@@ -1806,7 +2058,9 @@ impl AppClient {
             }
             rspotify::model::PlayableItem::Unknown(_) => return Ok(()),
         })
-        .replace('/', ""); // remove invalid characters from the file's name
+        .chars()
+        .filter(|c| !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+        .collect::<String>(); // remove invalid characters from the file's name
         let path = configs.cache_folder.join("image").join(filename);
 
         if configs.app_config.enable_cover_image_cache {
@@ -2045,7 +2299,10 @@ fn move_seed_track_to_front(tracks: &mut Vec<Track>, seed_track: Track) {
 
 #[cfg(test)]
 mod tests {
-    use super::{move_seed_track_to_front, parse_current_playback_response};
+    use super::{
+        move_seed_track_to_front, parse_current_playback_response,
+        parse_current_user_queue_response,
+    };
     use crate::state::Track;
     use rspotify::model::{PlayableItem, TrackId};
 
@@ -2138,5 +2395,45 @@ mod tests {
             .unwrap();
 
         assert!(matches!(playback.item, Some(PlayableItem::Track(_))));
+    }
+
+    #[test]
+    fn patches_missing_external_ids_in_user_queue() {
+        let track_json = serde_json::json!({
+            "album": {
+                "album_type": "album",
+                "artists": [],
+                "external_urls": {},
+                "href": null,
+                "id": null,
+                "images": [],
+                "name": "Skool Luv Affair"
+            },
+            "artists": [],
+            "disc_number": 1,
+            "duration_ms": 239_469,
+            "explicit": false,
+            "external_urls": {},
+            "href": "https://api.spotify.com/v1/tracks/6t7WriKgVszATnrdBKSUAf",
+            "id": "6t7WriKgVszATnrdBKSUAf",
+            "is_local": false,
+            "name": "Just One Day",
+            "preview_url": null,
+            "track_number": 5,
+            "type": "track"
+        });
+        let response = serde_json::json!({
+            "currently_playing": track_json.clone(),
+            "queue": [track_json]
+        });
+
+        let queue = parse_current_user_queue_response(&response.to_string()).unwrap();
+
+        assert!(matches!(
+            queue.currently_playing,
+            Some(PlayableItem::Track(_))
+        ));
+        assert_eq!(queue.queue.len(), 1);
+        assert!(matches!(queue.queue[0], PlayableItem::Track(_)));
     }
 }

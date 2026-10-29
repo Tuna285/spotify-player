@@ -84,7 +84,7 @@ pub struct SearchResults {
     pub episodes: Vec<Episode>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 /// A track order
 pub enum TrackOrder {
     AddedAt,
@@ -92,6 +92,44 @@ pub enum TrackOrder {
     Album,
     Artists,
     Duration,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Persistent sort/reverse state for a context's track list
+pub struct ContextSortState {
+    pub order: Option<TrackOrder>,
+    pub reversed: bool,
+}
+
+impl ContextSortState {
+    pub fn is_active(&self) -> bool {
+        self.order.is_some() || self.reversed
+    }
+
+    pub fn label(&self) -> Option<String> {
+        let order_name = self.order.map(|o| match o {
+            TrackOrder::AddedAt => "AddedAt",
+            TrackOrder::TrackName => "Track",
+            TrackOrder::Album => "Album",
+            TrackOrder::Artists => "Artists",
+            TrackOrder::Duration => "Duration",
+        });
+        match (order_name, self.reversed) {
+            (Some(name), true) => Some(format!("{name} ↓")),
+            (Some(name), false) => Some(format!("{name} ↑")),
+            (None, true) => Some("Reversed ↓".to_string()),
+            (None, false) => None,
+        }
+    }
+
+    pub fn apply(&self, tracks: &mut [Track]) {
+        if let Some(order) = self.order {
+            tracks.sort_by(|x, y| order.compare(x, y));
+        }
+        if self.reversed {
+            tracks.reverse();
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -145,7 +183,7 @@ pub struct Track {
     pub album: Option<Album>,
     pub duration: std::time::Duration,
     pub explicit: bool,
-    #[serde(skip)]
+    #[serde(default)]
     pub added_at: u64,
 }
 
@@ -711,15 +749,17 @@ impl Playback {
                 Playback::Context(id.clone(), Some(rspotify::model::Offset::Uri(uri)))
             }
             Playback::URIs(ids, _) => {
-                let ids = if ids.len() < limit {
+                let ids = if ids.len() <= limit {
                     ids.clone()
                 } else {
                     let pos = ids
                         .iter()
                         .position(|id| id.uri() == uri)
                         .unwrap_or_default();
-                    let l = pos.saturating_sub(limit / 2);
+                    let behind = std::cmp::min(limit / 5, 10);
+                    let l = pos.saturating_sub(behind);
                     let r = std::cmp::min(l + limit, ids.len());
+                    let l = r.saturating_sub(limit);
                     // For a list with too many tracks, to avoid payload limit when making the `start_playback`
                     // API request, we restrict the range of tracks to be played, which is based on the
                     // playing track's position (if any) and the application's limit (`app_config.tracks_playback_limit`).

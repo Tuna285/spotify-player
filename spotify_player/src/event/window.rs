@@ -5,7 +5,9 @@ use crate::{
         construct_album_actions, construct_artist_actions, construct_playlist_actions,
         construct_show_actions,
     },
-    state::{Episode, MutableWindowState, Show, UIStateGuard},
+    state::{
+        store_data_into_file_cache, Episode, FileCacheKey, MutableWindowState, Show, UIStateGuard,
+    },
 };
 use command::Action;
 use rand::RngExt;
@@ -134,17 +136,42 @@ pub fn handle_command_for_focused_context_window(
         // sort ordering commands
         if let Some(order) = order {
             let mut data = state.data.write();
+            let context_uri = context_id.uri();
             if let Some(tracks) = data.context_tracks_mut(context_id) {
                 tracks.sort_by(|x, y| order.compare(x, y));
             }
+            let sort_state = data
+                .user_data
+                .context_sort_orders
+                .entry(context_uri)
+                .or_default();
+            sort_state.order = Some(order);
+            sort_state.reversed = false;
+            let _ = store_data_into_file_cache(
+                FileCacheKey::ContextSortOrders,
+                &config::get_config().cache_folder,
+                &data.user_data.context_sort_orders,
+            );
             return Ok(true);
         }
         // reverse ordering command
         if command == Command::ReverseTrackOrder {
             let mut data = state.data.write();
+            let context_uri = context_id.uri();
             if let Some(tracks) = data.context_tracks_mut(context_id) {
                 tracks.reverse();
             }
+            let sort_state = data
+                .user_data
+                .context_sort_orders
+                .entry(context_uri)
+                .or_default();
+            sort_state.reversed = !sort_state.reversed;
+            let _ = store_data_into_file_cache(
+                FileCacheKey::ContextSortOrders,
+                &config::get_config().cache_folder,
+                &data.user_data.context_sort_orders,
+            );
             return Ok(true);
         }
     }
@@ -342,15 +369,20 @@ fn handle_command_for_track_table_window(
                 selected_track.id.uri()
             };
 
-            // Update currently_playing_tracks_id based on the context
-            match context_id {
-                Some(ContextId::Tracks(ref tracks_id)) => {
-                    state.player.write().currently_playing_tracks_id = Some(tracks_id.clone());
-                }
-                _ => {
-                    state.player.write().currently_playing_tracks_id = None;
-                }
+            // Update currently_playing_tracks_id and currently_playing_context_id based on the context
+            {
+                let mut player = state.player.write();
+                player.currently_playing_context_id = context_id.clone();
+                player.currently_playing_tracks_id = match context_id {
+                    Some(ContextId::Tracks(ref tracks_id)) => Some(tracks_id.clone()),
+                    _ => None,
+                };
             }
+
+            let is_custom_sorted = context_id
+                .as_ref()
+                .and_then(|id| data.user_data.context_sort_orders.get(&id.uri()))
+                .is_some_and(|s| s.is_active());
 
             let base_playback = match context_id {
                 None | Some(ContextId::Tracks(_)) => {
@@ -359,6 +391,9 @@ fn handle_command_for_track_table_window(
                 Some(ContextId::Show(_)) => unreachable!(
                     "show context should be handled by handle_command_for_episode_table_window"
                 ),
+                Some(_) if is_custom_sorted => {
+                    Playback::URIs(tracks.iter().map(|t| t.id.clone().into()).collect(), None)
+                }
                 Some(context_id) => Playback::Context(context_id, None),
             };
 
@@ -414,17 +449,23 @@ pub fn handle_command_for_track_list_window(
     }
     match command {
         Command::ChooseSelected => {
-            // for a track list, `ChooseSelected` on a track
-            // will start a `URIs` playback containing only that track.
-            // This is different from the track table, which handles
-            // `ChooseSelected` by starting a `URIs` playback
-            // containing all the tracks in the table.
-
             // Track lists are used for search results, so clear the Tracks context
-            state.player.write().currently_playing_tracks_id = None;
+            {
+                let mut player = state.player.write();
+                player.currently_playing_tracks_id = None;
+                player.currently_playing_context_id = None;
+            }
+
+            let uri = tracks[id].id.uri();
+            let limit = config::get_config().app_config.tracks_playback_limit;
+            let playback = Playback::URIs(
+                tracks.iter().map(|t| t.id.clone().into()).collect(),
+                None,
+            )
+            .uri_offset(uri, limit);
 
             client_pub.send(ClientRequest::Player(PlayerRequest::StartPlayback(
-                Playback::URIs(vec![tracks[id].id.clone().into()], None),
+                playback,
                 None,
             )))?;
         }
@@ -526,15 +567,16 @@ pub fn handle_command_for_playlist_list_window(
     playlists: &[&PlaylistFolderItem],
     data: &DataReadGuard,
     ui: &mut UIStateGuard,
-) -> bool {
+    client_pub: &flume::Sender<ClientRequest>,
+) -> Result<bool> {
     let id = ui.current_page_mut().selected().unwrap_or_default();
     if id >= playlists.len() {
-        return false;
+        return Ok(false);
     }
 
     let count = ui.count_prefix;
     if handle_navigation_command(command, ui.current_page_mut(), id, playlists.len(), count) {
-        return true;
+        return Ok(true);
     }
     match command {
         Command::ChooseSelected => {
@@ -548,7 +590,7 @@ pub fn handle_command_for_playlist_list_window(
                             state.focus = LibraryFocusState::Playlists;
                             state.playlist_folder_id = f.target_id;
                         }
-                        _ => return false,
+                        _ => return Ok(false),
                     }
                 }
                 PlaylistFolderItem::Playlist(p) => {
@@ -570,9 +612,14 @@ pub fn handle_command_for_playlist_list_window(
                 ));
             }
         }
-        _ => return false,
+        Command::AddSelectedItemToQueue => {
+            if let PlaylistFolderItem::Playlist(p) = playlists[id] {
+                client_pub.send(ClientRequest::AddPlaylistToQueue(p.id.clone()))?;
+            }
+        }
+        _ => return Ok(false),
     }
-    true
+    Ok(true)
 }
 
 pub fn handle_command_for_show_list_window(
@@ -631,7 +678,11 @@ pub fn handle_command_for_episode_list_window(
     match command {
         Command::ChooseSelected => {
             // Episodes don't have a Tracks context, so clear it
-            state.player.write().currently_playing_tracks_id = None;
+            {
+                let mut player = state.player.write();
+                player.currently_playing_tracks_id = None;
+                player.currently_playing_context_id = None;
+            }
 
             client_pub.send(ClientRequest::Player(PlayerRequest::StartPlayback(
                 Playback::URIs(vec![episodes[id].id.clone().into()], None),
@@ -678,7 +729,11 @@ fn handle_command_for_episode_table_window(
             let uri = episodes[id].id.uri();
 
             // Show context doesn't have a Tracks context, so clear it
-            state.player.write().currently_playing_tracks_id = None;
+            {
+                let mut player = state.player.write();
+                player.currently_playing_tracks_id = None;
+                player.currently_playing_context_id = None;
+            }
 
             client_pub.send(ClientRequest::Player(PlayerRequest::StartPlayback(
                 Playback::Context(

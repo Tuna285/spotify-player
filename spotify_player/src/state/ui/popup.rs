@@ -55,6 +55,7 @@ pub enum ActionListItem {
     Playlist(Playlist, Vec<command::Action>),
     Show(Show, Vec<command::Action>),
     Episode(Episode, Vec<command::Action>),
+    Tracks(Vec<Track>, String, Vec<command::Action>),
 }
 
 /// An action on an item in a playlist popup list
@@ -137,7 +138,8 @@ impl ActionListItem {
             | ActionListItem::Album(.., actions)
             | ActionListItem::Playlist(.., actions)
             | ActionListItem::Show(.., actions)
-            | ActionListItem::Episode(.., actions) => actions.len(),
+            | ActionListItem::Episode(.., actions)
+            | ActionListItem::Tracks(.., actions) => actions.len(),
         }
     }
 
@@ -149,6 +151,7 @@ impl ActionListItem {
             ActionListItem::Playlist(playlist, ..) => &playlist.name,
             ActionListItem::Show(show, ..) => &show.name,
             ActionListItem::Episode(episode, ..) => &episode.name,
+            ActionListItem::Tracks(_, desc, ..) => desc.as_str(),
         }
     }
 
@@ -159,7 +162,8 @@ impl ActionListItem {
             | ActionListItem::Album(.., actions)
             | ActionListItem::Playlist(.., actions)
             | ActionListItem::Show(.., actions)
-            | ActionListItem::Episode(.., actions) => {
+            | ActionListItem::Episode(.., actions)
+            | ActionListItem::Tracks(.., actions) => {
                 actions.iter().map(|a| format!("{a:?}")).collect::<Vec<_>>()
             }
         }

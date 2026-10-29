@@ -166,8 +166,13 @@ fn handle_page_change_event(
             // To avoid making too many requests, only request if context id is changed
             // or it's been a while since the last request.
             if let Some(id) = id {
+                let uri = id.uri();
+                let should_fetch = {
+                    let data = state.data.read();
+                    !data.caches.context.contains_key(&uri) && !data.caches.is_context_loading(&uri)
+                };
                 if !matches!(id, ContextId::Tracks(_))
-                    && !state.data.read().caches.context.contains_key(&id.uri())
+                    && should_fetch
                     && (new_id
                         || handler_state.last_get_context.elapsed() > CONTEXT_REFRESH_THROTTLE)
                 {

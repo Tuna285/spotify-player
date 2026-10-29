@@ -257,7 +257,7 @@ pub fn construct_artist_actions(artist: &Artist, data: &DataReadGuard) -> Vec<Ac
 
 /// constructs a list of actions on an playlist
 pub fn construct_playlist_actions(playlist: &Playlist, data: &DataReadGuard) -> Vec<Action> {
-    let mut actions = vec![Action::GoToRadio, Action::CopyLink];
+    let mut actions = vec![Action::AddToQueue, Action::GoToRadio, Action::CopyLink];
 
     if data
         .user_data

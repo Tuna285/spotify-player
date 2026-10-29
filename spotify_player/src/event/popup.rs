@@ -568,6 +568,16 @@ pub fn handle_item_action(
         ActionListItem::Episode(episode, actions) => {
             handle_action_in_context(actions[n], episode.into(), client_pub, &data, ui)
         }
+        ActionListItem::Tracks(tracks, _, actions) => match actions[n] {
+            Action::AddToQueue => {
+                client_pub.send(ClientRequest::AddTracksToQueue(
+                    tracks.into_iter().map(|t| t.id).collect(),
+                ))?;
+                ui.popup = None;
+                Ok(true)
+            }
+            _ => Ok(false),
+        },
     }
 }
 

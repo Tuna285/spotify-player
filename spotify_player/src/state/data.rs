@@ -1,12 +1,15 @@
 use std::io::{BufReader, BufWriter};
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::sync::LazyLock;
 
 use super::model::{
-    Album, Artist, Category, Context, ContextId, Id, Playlist, PlaylistFolderItem,
-    PlaylistFolderNode, SearchResults, Show, Track,
+    Album, Artist, Category, Context, ContextId, ContextSortState, Id, Playlist,
+    PlaylistFolderItem, PlaylistFolderNode, SearchResults, Show, Track,
 };
 use super::Lyrics;
 
@@ -20,6 +23,7 @@ pub enum FileCacheKey {
     SavedShows,
     SavedAlbums,
     SavedTracks,
+    ContextSortOrders,
 }
 
 /// default time-to-live cache duration
@@ -43,6 +47,7 @@ pub struct UserData {
     pub saved_shows: Vec<Show>,
     pub saved_albums: Vec<Album>,
     pub saved_tracks: HashMap<String, Track>,
+    pub context_sort_orders: HashMap<String, ContextSortState>,
 }
 
 #[derive(Debug)]
@@ -55,6 +60,7 @@ pub enum SearchCacheEntry {
 /// the application's in-memory caches
 pub struct MemoryCaches {
     pub context: ttl_cache::TtlCache<String, Context>,
+    pub loading_contexts: HashSet<String>,
     pub search: ttl_cache::TtlCache<String, SearchCacheEntry>,
     pub lyrics: ttl_cache::TtlCache<String, Option<Lyrics>>,
     pub genres: ttl_cache::TtlCache<String, Vec<String>>,
@@ -73,12 +79,25 @@ impl MemoryCaches {
     pub fn new() -> Self {
         Self {
             context: ttl_cache::TtlCache::new(64),
+            loading_contexts: HashSet::new(),
             search: ttl_cache::TtlCache::new(64),
             lyrics: ttl_cache::TtlCache::new(64),
             genres: ttl_cache::TtlCache::new(64),
             #[cfg(feature = "image")]
             images: ttl_cache::TtlCache::new(64),
         }
+    }
+
+    pub fn is_context_loading(&self, uri: &str) -> bool {
+        self.loading_contexts.contains(uri)
+    }
+
+    pub fn begin_context_fetch(&mut self, uri: &str) -> bool {
+        self.loading_contexts.insert(uri.to_string())
+    }
+
+    pub fn finish_context_fetch(&mut self, uri: &str) {
+        self.loading_contexts.remove(uri);
     }
 
     pub fn begin_search(&mut self, query: &str) -> bool {
@@ -182,6 +201,11 @@ impl UserData {
                 .unwrap_or_default(),
             saved_tracks: load_data_from_file_cache(FileCacheKey::SavedTracks, cache_folder)
                 .unwrap_or_default(),
+            context_sort_orders: load_data_from_file_cache(
+                FileCacheKey::ContextSortOrders,
+                cache_folder,
+            )
+            .unwrap_or_default(),
         }
     }
 
@@ -286,9 +310,104 @@ where
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedPlaylistTracks {
+    pub snapshot_id: String,
+    pub tracks: Vec<Track>,
+}
+
+pub fn load_playlist_tracks_cache(
+    playlist_id: &str,
+    snapshot_id: &str,
+    cache_folder: &Path,
+) -> Option<Vec<Track>> {
+    if snapshot_id.is_empty() {
+        return None;
+    }
+    let path = cache_folder
+        .join("playlist_tracks")
+        .join(format!("{playlist_id}.json"));
+    if !path.exists() {
+        return None;
+    }
+    let f = BufReader::new(std::fs::File::open(path).ok()?);
+    let cached: CachedPlaylistTracks = serde_json::from_reader(f).ok()?;
+    if cached.snapshot_id == snapshot_id {
+        Some(cached.tracks)
+    } else {
+        None
+    }
+}
+
+pub fn store_playlist_tracks_cache(
+    playlist_id: &str,
+    snapshot_id: String,
+    tracks: Vec<Track>,
+    cache_folder: &Path,
+) -> std::io::Result<()> {
+    let dir = cache_folder.join("playlist_tracks");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{playlist_id}.json"));
+    let f = BufWriter::new(std::fs::File::create(path)?);
+    serde_json::to_writer(f, &CachedPlaylistTracks { snapshot_id, tracks })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{MemoryCaches, SearchCacheEntry, SearchResults};
+    use crate::state::model::{ContextSortState, Track, TrackId, TrackOrder};
+
+    #[test]
+    fn context_fetch_lifecycle_suppresses_duplicate_requests() {
+        let mut caches = MemoryCaches::new();
+        let uri = "spotify:playlist:6ZXsoRtyeBVYjaBkoT0MgM";
+
+        assert!(!caches.is_context_loading(uri));
+        assert!(caches.begin_context_fetch(uri));
+        assert!(caches.is_context_loading(uri));
+        assert!(!caches.begin_context_fetch(uri));
+
+        caches.finish_context_fetch(uri);
+        assert!(!caches.is_context_loading(uri));
+        assert!(caches.begin_context_fetch(uri));
+    }
+
+    fn sample_track(id: &'static str, name: &str, added_at: u64) -> Track {
+        Track {
+            id: TrackId::from_id(id).unwrap().into_static(),
+            name: name.to_string(),
+            artists: vec![],
+            album: None,
+            duration: std::time::Duration::default(),
+            explicit: false,
+            added_at,
+        }
+    }
+
+    #[test]
+    fn context_sort_state_applies_and_serializes() {
+        let mut tracks = vec![
+            sample_track("3n3Ppam7vgaVa1iaRUc9Lp", "B", 10),
+            sample_track("4uLU6hMCjMI75M1A2tKUQC", "A", 30),
+            sample_track("1301WleyT98MSxVHPZCA6M", "C", 20),
+        ];
+
+        let state = ContextSortState {
+            order: Some(TrackOrder::AddedAt),
+            reversed: true,
+        };
+        assert!(state.is_active());
+        state.apply(&mut tracks);
+
+        assert_eq!(tracks[0].added_at, 30);
+        assert_eq!(tracks[1].added_at, 20);
+        assert_eq!(tracks[2].added_at, 10);
+
+        let json = serde_json::to_string(&state).unwrap();
+        let restored: ContextSortState = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, state);
+    }
 
     #[test]
     fn search_lifecycle_suppresses_duplicate_requests() {

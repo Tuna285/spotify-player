@@ -28,7 +28,7 @@ pub fn handle_key_sequence_for_page(
             PageType::Browse => handle_command_for_browse_page(command, client_pub, ui, state),
             // lyrics page doesn't support any commands
             PageType::Lyrics => Ok(false),
-            PageType::Queue => Ok(handle_command_for_queue_page(command, ui)),
+            PageType::Queue => handle_command_for_queue_page(command, client_pub, ui, state),
             PageType::CommandHelp => Ok(handle_command_for_command_help_page(command, ui)),
             PageType::Logs => Ok(handle_command_for_logs_page(command, ui)),
         },
@@ -160,7 +160,7 @@ fn handle_command_for_library_page(
     match focus_state {
         LibraryFocusState::Playlists => {
             let data = state.data.read();
-            Ok(window::handle_command_for_playlist_list_window(
+            window::handle_command_for_playlist_list_window(
                 command,
                 &ui.search_filtered_items(&data.user_data.folder_playlists_items(folder_id))
                     .into_iter()
@@ -168,7 +168,8 @@ fn handle_command_for_library_page(
                     .collect::<Vec<_>>(),
                 &data,
                 ui,
-            ))
+                client_pub,
+            )
         }
         LibraryFocusState::SavedAlbums => {
             // Use a read lock for the function call
@@ -317,12 +318,13 @@ fn handle_key_sequence_for_search_page(
 
             match found_keymap {
                 CommandOrAction::Command(command) => {
-                    Ok(window::handle_command_for_playlist_list_window(
+                    window::handle_command_for_playlist_list_window(
                         command,
                         &playlist_refs,
                         &data,
                         ui,
-                    ))
+                        client_pub,
+                    )
                 }
                 CommandOrAction::Action(action, ActionTarget::SelectedItem) => {
                     window::handle_action_for_selected_item(
@@ -429,7 +431,18 @@ fn handle_command_for_context_page(
                         ));
                         Ok(true)
                     }
-                    Context::Tracks { tracks: _, desc: _ } => Ok(false),
+                    Context::Tracks { tracks, desc } => {
+                        let actions = vec![Action::AddToQueue];
+                        ui.popup = Some(PopupState::ActionList(
+                            Box::new(ActionListItem::Tracks(
+                                tracks.clone(),
+                                desc.clone(),
+                                actions,
+                            )),
+                            ListState::default(),
+                        ));
+                        Ok(true)
+                    }
                 },
                 None => Ok(false),
             }
@@ -558,13 +571,104 @@ fn handle_command_for_browse_page(
     Ok(true)
 }
 
-fn handle_command_for_queue_page(command: Command, ui: &mut UIStateGuard) -> bool {
-    let scroll_offset = match ui.current_page() {
-        PageState::Queue { scroll_offset } => *scroll_offset,
-        _ => return false,
+fn handle_command_for_queue_page(
+    command: Command,
+    client_pub: &flume::Sender<ClientRequest>,
+    ui: &mut UIStateGuard,
+    state: &SharedState,
+) -> Result<bool> {
+    let (queue_len, selected_item, remaining_playables) = {
+        let player = state.player.read();
+        let queue = match player.queue {
+            Some(ref q) if !q.queue.is_empty() => &q.queue,
+            _ => return Ok(false),
+        };
+
+        let selected = ui.current_page_mut().selected().unwrap_or_default();
+        if selected >= queue.len() {
+            return Ok(false);
+        }
+
+        let selected_item = queue[selected].clone();
+        let remaining_playables: Vec<PlayableId<'static>> = queue[selected..]
+            .iter()
+            .filter_map(|item| match item {
+                rspotify::model::PlayableItem::Track(t) => {
+                    t.id.as_ref().map(|id| PlayableId::Track(id.clone_static()))
+                }
+                rspotify::model::PlayableItem::Episode(e) => {
+                    Some(PlayableId::Episode(e.id.clone_static()))
+                }
+                _ => None,
+            })
+            .collect();
+        (queue.len(), selected_item, remaining_playables)
     };
+
+    let selected = ui.current_page_mut().selected().unwrap_or_default();
     let count = ui.count_prefix;
-    handle_navigation_command(command, ui.current_page_mut(), scroll_offset, 10000, count)
+    if handle_navigation_command(command, ui.current_page_mut(), selected, queue_len, count) {
+        return Ok(true);
+    }
+
+    match command {
+        Command::ChooseSelected => {
+            {
+                let mut player = state.player.write();
+                player.currently_playing_tracks_id = None;
+                player.currently_playing_context_id = None;
+            }
+
+            if !remaining_playables.is_empty() {
+                client_pub.send(ClientRequest::Player(PlayerRequest::StartPlayback(
+                    Playback::URIs(remaining_playables, None),
+                    None,
+                )))?;
+                client_pub.send(ClientRequest::GetCurrentUserQueue)?;
+            }
+        }
+        Command::ShowActionsOnSelectedItem => {
+            match selected_item {
+                rspotify::model::PlayableItem::Track(full_track) => {
+                    if let Some(track) = Track::try_from_full_track(full_track) {
+                        let data = state.data.read();
+                        let actions = crate::command::construct_track_actions(&track, &data);
+                        ui.popup = Some(PopupState::ActionList(
+                            Box::new(ActionListItem::Track(track, actions)),
+                            ListState::default(),
+                        ));
+                    }
+                }
+                rspotify::model::PlayableItem::Episode(full_episode) => {
+                    let episode: Episode = full_episode.into();
+                    let data = state.data.read();
+                    let actions = crate::command::construct_episode_actions(&episode, &data);
+                    ui.popup = Some(PopupState::ActionList(
+                        Box::new(ActionListItem::Episode(episode, actions)),
+                        ListState::default(),
+                    ));
+                }
+                _ => return Ok(false),
+            }
+        }
+        Command::AddSelectedItemToQueue => {
+            let playable_id = match selected_item {
+                rspotify::model::PlayableItem::Track(t) => {
+                    t.id.as_ref().map(|id| PlayableId::Track(id.clone_static()))
+                }
+                rspotify::model::PlayableItem::Episode(e) => {
+                    Some(PlayableId::Episode(e.id.clone_static()))
+                }
+                _ => None,
+            };
+            if let Some(id) = playable_id {
+                client_pub.send(ClientRequest::AddPlayableToQueue(id))?;
+            }
+        }
+        _ => return Ok(false),
+    }
+
+    Ok(true)
 }
 
 fn handle_command_for_command_help_page(command: Command, ui: &mut UIStateGuard) -> bool {

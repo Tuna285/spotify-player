@@ -18,6 +18,8 @@ pub struct PlayerState {
 
     /// The currently playing Tracks context (for contexts not tracked by Spotify's playback, e.g. liked/top tracks)
     pub currently_playing_tracks_id: Option<TracksId>,
+    /// The currently playing context override (for custom-sorted contexts played via URIs)
+    pub currently_playing_context_id: Option<ContextId>,
 
     /// App-managed custom queue for full playlist/album playback.
     /// Active when the integrated librespot player is streaming and the user
@@ -104,6 +106,7 @@ impl PlayerState {
                     .custom_queue
                     .as_ref()
                     .and_then(|q| q.source_context().cloned())
+                    .or_else(|| self.currently_playing_context_id.clone())
                     .or_else(|| {
                         self.currently_playing_tracks_id
                             .clone()

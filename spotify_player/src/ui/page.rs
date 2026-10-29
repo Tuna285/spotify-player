@@ -354,7 +354,7 @@ pub fn render_context_page(
             // render context description
             let chunks = Layout::vertical([Constraint::Length(1), Constraint::Fill(0)]).split(rect);
 
-            let description = if let Context::Playlist { playlist, .. } = context {
+            let mut description = if let Context::Playlist { playlist, .. } = context {
                 format!(
                     "{} | {}",
                     context.description(),
@@ -367,6 +367,14 @@ pub fn render_context_page(
             } else {
                 context.description()
             };
+            if let Some(sort_label) = data
+                .user_data
+                .context_sort_orders
+                .get(&id.uri())
+                .and_then(|s| s.label())
+            {
+                description = format!("{description} | Sort: {sort_label}");
+            }
 
             frame.render_widget(
                 Paragraph::new(description).style(ui.theme.page_desc()),
@@ -848,17 +856,6 @@ pub fn render_queue_page(
         Some(ref q) => &q.queue,
         None => return,
     };
-    let scroll_offset = match ui.current_page_mut() {
-        PageState::Queue {
-            ref mut scroll_offset,
-        } => {
-            if !queue.is_empty() && *scroll_offset >= queue.len() {
-                *scroll_offset = queue.len() - 1;
-            }
-            *scroll_offset
-        }
-        _ => return,
-    };
 
     // 2. Construct the page's layout
     let rect = construct_and_render_block("Queue", &ui.theme, Borders::ALL, frame, rect);
@@ -868,7 +865,6 @@ pub fn render_queue_page(
         queue
             .iter()
             .enumerate()
-            .skip(scroll_offset)
             .map(|(i, x)| {
                 Row::new(vec![
                     Cell::from(format!("{}", i + 1)),
@@ -885,6 +881,8 @@ pub fn render_queue_page(
             Constraint::Percentage(20),
         ],
     )
+    .column_spacing(2)
+    .row_highlight_style(ui.theme.selection(true))
     .header(
         Row::new(vec![
             Cell::from("#"),
@@ -896,7 +894,10 @@ pub fn render_queue_page(
     );
 
     // 4. Render page's widget
-    frame.render_widget(queue_table, rect);
+    let PageState::Queue { ref mut state } = ui.current_page_mut() else {
+        return;
+    };
+    crate::ui::utils::render_table_window(frame, queue_table, rect, queue.len(), state);
 }
 
 /// Render windows for an artist context page, which includes

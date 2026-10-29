@@ -11,7 +11,7 @@ use crate::{
     state::{
         ActionListItem, Album, AlbumId, Artist, ArtistFocusState, ArtistId, ArtistPopupAction,
         BrowsePageUIState, ConfirmableAction, Context, ContextId, ContextPageType,
-        ContextPageUIState, DataReadGuard, Focusable, Id, Item, ItemId, LibraryFocusState,
+        ContextPageUIState, DataReadGuard, Episode, Focusable, Id, Item, ItemId, LibraryFocusState,
         LibraryPageUIState, PageState, PageType, PlayableId, Playback, PlaylistCreateCurrentField,
         PlaylistFolderItem, PlaylistId, PlaylistPopupAction, PopupState, SearchFocusState,
         SearchPageUIState, SharedState, ShowId, Track, TrackId, TrackOrder, TracksId, UIStateGuard,
@@ -26,7 +26,7 @@ use anyhow::{Context as _, Result};
 use crossterm::event::KeyCode;
 
 use clipboard::{execute_copy_command, get_clipboard_content};
-use ratatui::widgets::ListState;
+use ratatui::widgets::{ListState, TableState};
 
 mod clipboard;
 mod page;
@@ -371,6 +371,11 @@ pub fn handle_action_in_context(
                 ui.popup = None;
                 Ok(true)
             }
+            Action::AddToQueue => {
+                client_pub.send(ClientRequest::AddPlaylistToQueue(playlist.id))?;
+                ui.popup = None;
+                Ok(true)
+            }
             Action::GoToRadio => {
                 handle_go_to_radio(&playlist.id.uri(), &playlist.name, ui, client_pub)?;
                 Ok(true)
@@ -645,6 +650,9 @@ fn handle_global_command(
         }
         Command::RefreshPlayback => {
             client_pub.send(ClientRequest::GetCurrentPlayback)?;
+            if ui.current_page().page_type() == PageType::Queue {
+                client_pub.send(ClientRequest::GetCurrentUserQueue)?;
+            }
         }
         Command::ShowActionsOnCurrentTrack => {
             if let Some(currently_playing) = state.player.read().currently_playing() {
@@ -773,7 +781,11 @@ fn handle_global_command(
                         let id = TrackId::from_id(id)?.into_static();
 
                         // Clear Tracks context when playing from clipboard link
-                        state.player.write().currently_playing_tracks_id = None;
+                        {
+                            let mut player = state.player.write();
+                            player.currently_playing_tracks_id = None;
+                            player.currently_playing_context_id = None;
+                        }
 
                         client_pub.send(ClientRequest::Player(PlayerRequest::StartPlayback(
                             Playback::URIs(vec![id.into()], None),
@@ -859,7 +871,9 @@ fn handle_global_command(
             }
         }
         Command::Queue => {
-            ui.new_page(PageState::Queue { scroll_offset: 0 });
+            ui.new_page(PageState::Queue {
+                state: TableState::default(),
+            });
             client_pub.send(ClientRequest::GetCurrentUserQueue)?;
         }
         Command::CreatePlaylist => {
