@@ -743,6 +743,7 @@ impl TracksId {
 
 impl Playback {
     /// creates new playback with a specified offset based on the current playback
+    #[allow(dead_code)]
     pub fn uri_offset(&self, uri: String, limit: usize) -> Self {
         match self {
             Playback::Context(id, _) => {

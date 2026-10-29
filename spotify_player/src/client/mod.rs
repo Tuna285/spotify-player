@@ -841,8 +841,14 @@ impl AppClient {
         tokio::task::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             let _ = client.retrieve_current_playback(&state, false).await;
+            if let Ok(queue) = client.current_user_queue2().await {
+                state.player.write().queue = Some(queue);
+            }
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             let _ = client.retrieve_current_playback(&state, false).await;
+            if let Ok(queue) = client.current_user_queue2().await {
+                state.player.write().queue = Some(queue);
+            }
         });
     }
 
@@ -1148,6 +1154,25 @@ impl AppClient {
                         }
                     }
                 }
+                // Spotify Web API for `uris` does not accept `Offset::Uri`.
+                // It only accepts `Offset::Position` or no offset (starts at index 0).
+                // If an `Offset::Uri` was passed, reorder `ids` so that the target URI
+                // is at index 0 and clear `offset`.
+                let offset = match offset {
+                    Some(rspotify::model::Offset::Uri(ref target_uri)) => {
+                        if let Some(pos) = ids.iter().position(|id| id.uri() == *target_uri) {
+                            if pos > 0 {
+                                let mut reordered = Vec::with_capacity(ids.len());
+                                reordered.extend(ids.drain(pos..));
+                                reordered.append(&mut ids);
+                                ids = reordered;
+                            }
+                        }
+                        None
+                    }
+                    other => other,
+                };
+
                 self.start_uris_playback(ids, device_id, offset, None)
                     .await?;
             }

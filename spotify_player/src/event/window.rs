@@ -384,22 +384,59 @@ fn handle_command_for_track_table_window(
                 .and_then(|id| data.user_data.context_sort_orders.get(&id.uri()))
                 .is_some_and(|s| s.is_active());
 
-            let base_playback = match context_id {
-                None | Some(ContextId::Tracks(_)) => {
-                    Playback::URIs(tracks.iter().map(|t| t.id.clone().into()).collect(), None)
+            let is_shuffle = state
+                .player
+                .read()
+                .playback
+                .as_ref()
+                .map(|p| p.shuffle_state)
+                .unwrap_or(false);
+
+            let playback = match context_id {
+                Some(context_id) if !is_custom_sorted => {
+                    Playback::Context(context_id, Some(rspotify::model::Offset::Uri(uri)))
                 }
-                Some(ContextId::Show(_)) => unreachable!(
-                    "show context should be handled by handle_command_for_episode_table_window"
-                ),
-                Some(_) if is_custom_sorted => {
-                    Playback::URIs(tracks.iter().map(|t| t.id.clone().into()).collect(), None)
+                _ => {
+                    let limit = config::get_config().app_config.tracks_playback_limit;
+                    let mut ordered_ids: Vec<PlayableId<'static>> = Vec::with_capacity(limit);
+                    let selected_uri = uri;
+                    let selected_id = tracks
+                        .iter()
+                        .find(|t| t.id.uri() == selected_uri)
+                        .map(|t| t.id.clone().into())
+                        .unwrap_or_else(|| selected_track.id.clone().into());
+                    ordered_ids.push(selected_id);
+
+                    let other_tracks: Vec<PlayableId<'static>> = tracks
+                        .iter()
+                        .filter(|t| t.id.uri() != selected_uri)
+                        .map(|t| t.id.clone().into())
+                        .collect();
+
+                    if is_shuffle {
+                        use rand::seq::SliceRandom;
+                        let mut shuffled = other_tracks;
+                        shuffled.shuffle(&mut rand::rng());
+                        let take_count = limit.saturating_sub(1);
+                        ordered_ids.extend(shuffled.into_iter().take(take_count));
+                    } else {
+                        let pos = tracks
+                            .iter()
+                            .position(|t| t.id.uri() == selected_uri)
+                            .unwrap_or(source_index);
+                        let after_tracks = tracks[pos + 1..].iter().map(|t| t.id.clone().into());
+                        let before_tracks = tracks[..pos].iter().map(|t| t.id.clone().into());
+                        let sequential = after_tracks.chain(before_tracks);
+                        let take_count = limit.saturating_sub(1);
+                        ordered_ids.extend(sequential.take(take_count));
+                    }
+
+                    Playback::URIs(ordered_ids, None)
                 }
-                Some(context_id) => Playback::Context(context_id, None),
             };
 
             client_pub.send(ClientRequest::Player(PlayerRequest::StartPlayback(
-                base_playback
-                    .uri_offset(uri, config::get_config().app_config.tracks_playback_limit),
+                playback,
                 None,
             )))?;
         }
@@ -456,16 +493,8 @@ pub fn handle_command_for_track_list_window(
                 player.currently_playing_context_id = None;
             }
 
-            let uri = tracks[id].id.uri();
-            let limit = config::get_config().app_config.tracks_playback_limit;
-            let playback = Playback::URIs(
-                tracks.iter().map(|t| t.id.clone().into()).collect(),
-                None,
-            )
-            .uri_offset(uri, limit);
-
             client_pub.send(ClientRequest::Player(PlayerRequest::StartPlayback(
-                playback,
+                Playback::URIs(vec![tracks[id].id.clone().into()], None),
                 None,
             )))?;
         }
