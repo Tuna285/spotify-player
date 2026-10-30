@@ -39,6 +39,7 @@ pub fn handle_key_sequence_for_page(
                 window::handle_action_for_focused_context_page(action, client_pub, ui, state)
             }
             PageType::Browse => handle_action_for_browse_page(action, client_pub, ui, state),
+            PageType::Queue => handle_action_for_queue_page(action, client_pub, ui, state),
             _ => Ok(false),
         },
         _ => Ok(false),
@@ -571,45 +572,98 @@ fn handle_command_for_browse_page(
     Ok(true)
 }
 
+fn handle_action_for_queue_page(
+    action: Action,
+    client_pub: &flume::Sender<ClientRequest>,
+    ui: &mut UIStateGuard,
+    state: &SharedState,
+) -> Result<bool> {
+    let player = state.player.read();
+    let queue = match player.queue {
+        Some(ref q) if !q.queue.is_empty() => &q.queue,
+        _ => return Ok(false),
+    };
+    let selected = ui
+        .current_page_mut()
+        .selected()
+        .unwrap_or_default()
+        .min(queue.len().saturating_sub(1));
+    match &queue[selected] {
+        rspotify::model::PlayableItem::Track(full_track) => {
+            if let Some(track) = Track::try_from_full_track(full_track.clone()) {
+                let data = state.data.read();
+                handle_action_in_context(action, track.into(), client_pub, &data, ui)
+            } else {
+                Ok(false)
+            }
+        }
+        rspotify::model::PlayableItem::Episode(full_episode) => {
+            let episode: Episode = full_episode.clone().into();
+            let data = state.data.read();
+            handle_action_in_context(action, episode.into(), client_pub, &data, ui)
+        }
+        _ => Ok(false),
+    }
+}
+
 fn handle_command_for_queue_page(
     command: Command,
     client_pub: &flume::Sender<ClientRequest>,
     ui: &mut UIStateGuard,
     state: &SharedState,
 ) -> Result<bool> {
-    let (queue_len, selected_item, remaining_playables) = {
+    let queue_len = {
+        let player = state.player.read();
+        match player.queue {
+            Some(ref q) => q.queue.len(),
+            None => 0,
+        }
+    };
+
+    if queue_len == 0 {
+        return Ok(false);
+    }
+
+    let selected = ui
+        .current_page_mut()
+        .selected()
+        .unwrap_or_default()
+        .min(queue_len.saturating_sub(1));
+    let count = ui.count_prefix;
+    if handle_navigation_command(command, ui.current_page_mut(), selected, queue_len, count) {
+        return Ok(true);
+    }
+
+    let selected = ui
+        .current_page_mut()
+        .selected()
+        .unwrap_or_default()
+        .min(queue_len.saturating_sub(1));
+
+    let (selected_item, remaining_playables) = {
         let player = state.player.read();
         let queue = match player.queue {
             Some(ref q) if !q.queue.is_empty() => &q.queue,
             _ => return Ok(false),
         };
-
-        let selected = ui.current_page_mut().selected().unwrap_or_default();
-        if selected >= queue.len() {
-            return Ok(false);
-        }
-
         let selected_item = queue[selected].clone();
+        let is_first_track = matches!(selected_item, rspotify::model::PlayableItem::Track(_));
+        let limit = config::get_config().app_config.tracks_playback_limit.min(50);
         let remaining_playables: Vec<PlayableId<'static>> = queue[selected..]
             .iter()
+            .take(limit)
             .filter_map(|item| match item {
-                rspotify::model::PlayableItem::Track(t) => {
+                rspotify::model::PlayableItem::Track(t) if is_first_track => {
                     t.id.as_ref().map(|id| PlayableId::Track(id.clone_static()))
                 }
-                rspotify::model::PlayableItem::Episode(e) => {
+                rspotify::model::PlayableItem::Episode(e) if !is_first_track => {
                     Some(PlayableId::Episode(e.id.clone_static()))
                 }
                 _ => None,
             })
             .collect();
-        (queue.len(), selected_item, remaining_playables)
+        (selected_item, remaining_playables)
     };
-
-    let selected = ui.current_page_mut().selected().unwrap_or_default();
-    let count = ui.count_prefix;
-    if handle_navigation_command(command, ui.current_page_mut(), selected, queue_len, count) {
-        return Ok(true);
-    }
 
     match command {
         Command::ChooseSelected => {

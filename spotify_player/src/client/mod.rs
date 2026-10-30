@@ -699,12 +699,13 @@ impl AppClient {
                 let album_context = self.album_context(album_id).await?;
 
                 if let Context::Album { album: _, tracks } = album_context {
-                    let limit = config::get_config().app_config.tracks_playback_limit.min(50);
+                    let limit = config::get_config().app_config.tracks_playback_limit.min(20);
                     for track in tracks.into_iter().take(limit) {
                         if let Err(err) = self.add_item_to_queue(PlayableId::Track(track.id), None).await {
                             tracing::warn!("Failed to add track to queue: {err:#}");
                             break;
                         }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                     if let Ok(queue) = self.current_user_queue2().await {
                         state.player.write().queue = Some(queue);
@@ -715,12 +716,13 @@ impl AppClient {
                 let playlist_context = self.playlist_context(playlist_id).await?;
 
                 if let Context::Playlist { tracks, .. } = playlist_context {
-                    let limit = config::get_config().app_config.tracks_playback_limit.min(50);
+                    let limit = config::get_config().app_config.tracks_playback_limit.min(20);
                     for track in tracks.into_iter().take(limit) {
                         if let Err(err) = self.add_item_to_queue(PlayableId::Track(track.id), None).await {
                             tracing::warn!("Failed to add track to queue: {err:#}");
                             break;
                         }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                     if let Ok(queue) = self.current_user_queue2().await {
                         state.player.write().queue = Some(queue);
@@ -728,12 +730,13 @@ impl AppClient {
                 }
             }
             ClientRequest::AddTracksToQueue(track_ids) => {
-                let limit = config::get_config().app_config.tracks_playback_limit.min(50);
+                let limit = config::get_config().app_config.tracks_playback_limit.min(20);
                 for track_id in track_ids.into_iter().take(limit) {
                     if let Err(err) = self.add_item_to_queue(PlayableId::Track(track_id), None).await {
                         tracing::warn!("Failed to add track to queue: {err:#}");
                         break;
                     }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
                 if let Ok(queue) = self.current_user_queue2().await {
                     state.player.write().queue = Some(queue);

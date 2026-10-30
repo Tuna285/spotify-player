@@ -393,7 +393,9 @@ fn handle_command_for_track_table_window(
                 .unwrap_or(false);
 
             let playback = match context_id {
-                Some(context_id) if !is_custom_sorted => {
+                Some(context_id)
+                    if !is_custom_sorted && !matches!(context_id, ContextId::Tracks(_)) =>
+                {
                     Playback::Context(context_id, Some(rspotify::model::Offset::Uri(uri)))
                 }
                 _ => {
