@@ -473,7 +473,6 @@ pub fn render_library_page(
         (ctx_uri, track_uri)
     };
     let data = state.data.read();
-    let configs = config::get_config();
 
     let (focus_state, playlist_folder_id) = match ui.current_page() {
         PageState::Library { state } => (state.focus, state.playlist_folder_id),
@@ -481,38 +480,46 @@ pub fn render_library_page(
     };
 
     // 2. Construct the 2-tier dashboard layout:
-    // Top row (60%):    [Playlists | Recently Played | Recommended Stations]
-    // Bottom row (40%): [Top Tracks | Albums | Artists]
-    let rows = Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)]).split(rect);
+    // Top row (50%):    [Playlists | Recently Played | Recommended Stations]
+    // Bottom row (50%): [Top Tracks | Albums | Artists]
+    let rows = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(rect);
     let col_constraints = [
-        Constraint::Percentage(configs.app_config.layout.library.playlist_percent),
-        Constraint::Percentage(configs.app_config.layout.library.album_percent),
-        Constraint::Percentage(
-            100 - (configs.app_config.layout.library.album_percent
-                + configs.app_config.layout.library.playlist_percent),
-        ),
+        Constraint::Ratio(1, 3),
+        Constraint::Ratio(1, 3),
+        Constraint::Ratio(1, 3),
     ];
     let top_chunks = ui.orientation.layout(col_constraints).split(rows[0]);
     let bot_chunks = ui.orientation.layout(col_constraints).split(rows[1]);
 
+    let border_for = |col: usize| match ui.orientation {
+        Orientation::Horizontal => {
+            if col == 2 {
+                Borders::ALL
+            } else {
+                Borders::TOP | Borders::LEFT | Borders::BOTTOM
+            }
+        }
+        Orientation::Vertical => Borders::ALL,
+    };
+
     let playlist_rect = construct_and_render_block(
         "Playlists",
         &ui.theme,
-        Borders::TOP | Borders::LEFT | Borders::BOTTOM,
+        border_for(0),
         frame,
         top_chunks[0],
     );
     let recent_rect = construct_and_render_block(
         "Recently Played",
         &ui.theme,
-        Borders::TOP | Borders::LEFT | Borders::BOTTOM,
+        border_for(1),
         frame,
         top_chunks[1],
     );
     let station_rect = construct_and_render_block(
         "Recommended Stations",
         &ui.theme,
-        Borders::ALL,
+        border_for(2),
         frame,
         top_chunks[2],
     );
@@ -520,21 +527,21 @@ pub fn render_library_page(
     let top_track_rect = construct_and_render_block(
         "Top Tracks",
         &ui.theme,
-        Borders::LEFT | Borders::BOTTOM,
+        border_for(0),
         frame,
         bot_chunks[0],
     );
     let album_rect = construct_and_render_block(
         "Albums",
         &ui.theme,
-        Borders::LEFT | Borders::BOTTOM,
+        border_for(1),
         frame,
         bot_chunks[1],
     );
     let artist_rect = construct_and_render_block(
         "Artists",
         &ui.theme,
-        Borders::LEFT | Borders::RIGHT | Borders::BOTTOM,
+        border_for(2),
         frame,
         bot_chunks[2],
     );
@@ -574,7 +581,7 @@ pub fn render_library_page(
             .into_iter()
             .map(|t| {
                 (
-                    t.to_bidi_string(),
+                    to_bidi_string(&format!("{} • {}", t.display_name(), t.artists_info())),
                     curr_track_uri.as_deref() == Some(&t.id.uri()),
                 )
             })
@@ -619,7 +626,7 @@ pub fn render_library_page(
             .into_iter()
             .map(|t| {
                 (
-                    t.to_bidi_string(),
+                    to_bidi_string(&format!("{} • {}", t.display_name(), t.artists_info())),
                     curr_track_uri.as_deref() == Some(&t.id.uri()),
                 )
             })
