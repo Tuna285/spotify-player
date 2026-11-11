@@ -517,6 +517,49 @@ pub fn handle_command_for_track_list_window(
     Ok(true)
 }
 
+pub fn handle_command_for_station_list_window(
+    command: Command,
+    client_pub: &flume::Sender<ClientRequest>,
+    tracks: &[&Track],
+    data: &DataReadGuard,
+    ui: &mut UIStateGuard,
+) -> Result<bool> {
+    let id = ui.current_page_mut().selected().unwrap_or_default();
+    if id >= tracks.len() {
+        return Ok(false);
+    }
+
+    let count = ui.count_prefix;
+    if handle_navigation_command(command, ui.current_page_mut(), id, tracks.len(), count) {
+        return Ok(true);
+    }
+    match command {
+        Command::ChooseSelected => {
+            let seed_uri = tracks[id].id.uri();
+            let seed_name = &tracks[id].name;
+            let radio_id = TracksId::new(format!("radio:{seed_uri}"), format!("{seed_name} Radio"));
+            ui.new_page(PageState::Context {
+                id: None,
+                context_page_type: ContextPageType::Browsing(ContextId::Tracks(radio_id.clone())),
+                state: None,
+            });
+            client_pub.send(ClientRequest::GetContext(ContextId::Tracks(radio_id)))?;
+        }
+        Command::ShowActionsOnSelectedItem => {
+            let actions = command::construct_track_actions(tracks[id], data);
+            ui.popup = Some(PopupState::ActionList(
+                Box::new(ActionListItem::Track(tracks[id].clone(), actions)),
+                ListState::default(),
+            ));
+        }
+        Command::AddSelectedItemToQueue => {
+            client_pub.send(ClientRequest::AddRadioToQueue(tracks[id].id.uri()))?;
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
 pub fn handle_command_for_artist_list_window(
     command: Command,
     artists: &[&Artist],

@@ -623,14 +623,37 @@ impl AppClient {
                             ContextId::Album(album_id) => self.album_context(album_id).await?,
                             ContextId::Artist(artist_id) => self.artist_context(artist_id).await?,
                             ContextId::Tracks(tracks_id) => match tracks_id.uri.as_str() {
-                                USER_TOP_TRACKS_URI => Context::Tracks {
-                                    tracks: self.current_user_top_tracks().await?,
-                                    desc: "User's top tracks".to_string(),
-                                },
-                                USER_RECENTLY_PLAYED_TRACKS_URI => Context::Tracks {
-                                    tracks: self.current_user_recently_played_tracks().await?,
-                                    desc: "User's recently played tracks".to_string(),
-                                },
+                                USER_TOP_TRACKS_URI => {
+                                    let tracks = self.current_user_top_tracks().await?;
+                                    store_data_into_file_cache(
+                                        FileCacheKey::TopTracks,
+                                        &config::get_config().cache_folder,
+                                        &tracks,
+                                    )
+                                    .context("store user's top tracks into the cache folder")?;
+                                    state.data.write().user_data.top_tracks = tracks.clone();
+                                    Context::Tracks {
+                                        tracks,
+                                        desc: "User's top tracks".to_string(),
+                                    }
+                                }
+                                USER_RECENTLY_PLAYED_TRACKS_URI => {
+                                    let tracks = self.current_user_recently_played_tracks().await?;
+                                    store_data_into_file_cache(
+                                        FileCacheKey::RecentlyPlayedTracks,
+                                        &config::get_config().cache_folder,
+                                        &tracks,
+                                    )
+                                    .context(
+                                        "store user's recently played tracks into the cache folder",
+                                    )?;
+                                    state.data.write().user_data.recently_played_tracks =
+                                        tracks.clone();
+                                    Context::Tracks {
+                                        tracks,
+                                        desc: "User's recently played tracks".to_string(),
+                                    }
+                                }
                                 USER_LIKED_TRACKS_URI => {
                                     let tracks = self.current_user_saved_tracks().await?;
                                     let tracks_hm = tracks
@@ -730,6 +753,20 @@ impl AppClient {
                 }
             }
             ClientRequest::AddTracksToQueue(track_ids) => {
+                let limit = config::get_config().app_config.tracks_playback_limit.min(20);
+                for track_id in track_ids.into_iter().take(limit) {
+                    if let Err(err) = self.add_item_to_queue(PlayableId::Track(track_id), None).await {
+                        tracing::warn!("Failed to add track to queue: {err:#}");
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                if let Ok(queue) = self.current_user_queue2().await {
+                    state.player.write().queue = Some(queue);
+                }
+            }
+            ClientRequest::AddRadioToQueue(seed_uri) => {
+                let track_ids = self.mercury_radio_track_ids(&seed_uri).await?;
                 let limit = config::get_config().app_config.tracks_playback_limit.min(20);
                 for track_id in track_ids.into_iter().take(limit) {
                     if let Err(err) = self.add_item_to_queue(PlayableId::Track(track_id), None).await {
@@ -2019,6 +2056,16 @@ impl AppClient {
         };
 
         // retrieve current artist for genres if not in cache
+        if let rspotify::model::PlayableItem::Track(ref full_track) = curr_item {
+            if let Some(track) = Track::try_from_full_track(full_track.clone()) {
+                let mut data = state.data.write();
+                data.user_data
+                    .recently_played_tracks
+                    .retain(|t| t.id != track.id && t.name != track.name);
+                data.user_data.recently_played_tracks.insert(0, track);
+                data.user_data.recently_played_tracks.truncate(50);
+            }
+        }
         let curr_artist = match &curr_item {
             rspotify::model::PlayableItem::Track(full_track) => {
                 let cached = state

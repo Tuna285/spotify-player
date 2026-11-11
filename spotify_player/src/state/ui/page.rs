@@ -53,6 +53,9 @@ pub enum PageType {
 #[derive(Clone, Debug, PartialEq)]
 pub struct LibraryPageUIState {
     pub playlist_list: ListState,
+    pub recently_played_list: ListState,
+    pub recommended_station_list: ListState,
+    pub top_track_list: ListState,
     pub saved_album_list: ListState,
     pub followed_artist_list: ListState,
     pub focus: LibraryFocusState,
@@ -102,6 +105,9 @@ pub enum ContextPageUIState {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum LibraryFocusState {
     Playlists,
+    RecentlyPlayed,
+    RecommendedStations,
+    TopTracks,
     SavedAlbums,
     FollowedArtists,
 }
@@ -177,6 +183,9 @@ impl PageState {
                 state:
                     LibraryPageUIState {
                         playlist_list,
+                        recently_played_list,
+                        recommended_station_list,
+                        top_track_list,
                         saved_album_list,
                         followed_artist_list,
                         focus,
@@ -184,6 +193,13 @@ impl PageState {
                     },
             } => Some(match focus {
                 LibraryFocusState::Playlists => MutableWindowState::List(playlist_list),
+                LibraryFocusState::RecentlyPlayed => {
+                    MutableWindowState::List(recently_played_list)
+                }
+                LibraryFocusState::RecommendedStations => {
+                    MutableWindowState::List(recommended_station_list)
+                }
+                LibraryFocusState::TopTracks => MutableWindowState::List(top_track_list),
                 LibraryFocusState::SavedAlbums => MutableWindowState::List(saved_album_list),
                 LibraryFocusState::FollowedArtists => {
                     MutableWindowState::List(followed_artist_list)
@@ -252,6 +268,9 @@ impl LibraryPageUIState {
     pub fn new() -> Self {
         Self {
             playlist_list: ListState::default(),
+            recently_played_list: ListState::default(),
+            recommended_station_list: ListState::default(),
+            top_track_list: ListState::default(),
             saved_album_list: ListState::default(),
             followed_artist_list: ListState::default(),
             focus: LibraryFocusState::Playlists,
@@ -422,7 +441,10 @@ macro_rules! impl_focusable {
 
 impl_focusable!(
     LibraryFocusState,
-    [Playlists, SavedAlbums],
+    [Playlists, RecentlyPlayed],
+    [RecentlyPlayed, RecommendedStations],
+    [RecommendedStations, TopTracks],
+    [TopTracks, SavedAlbums],
     [SavedAlbums, FollowedArtists],
     [FollowedArtists, Playlists]
 );

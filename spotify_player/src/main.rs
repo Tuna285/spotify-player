@@ -124,6 +124,12 @@ async fn start_app(state: &state::SharedState) -> Result<()> {
     client_pub.send(client::ClientRequest::GetContext(state::ContextId::Tracks(
         state::USER_LIKED_TRACKS_ID.to_owned(),
     )))?;
+    client_pub.send(client::ClientRequest::GetContext(state::ContextId::Tracks(
+        state::USER_RECENTLY_PLAYED_TRACKS_ID.to_owned(),
+    )))?;
+    client_pub.send(client::ClientRequest::GetContext(state::ContextId::Tracks(
+        state::USER_TOP_TRACKS_ID.to_owned(),
+    )))?;
     client_pub.send(client::ClientRequest::GetUserSavedShows)?;
 
     // client socket task (for handling CLI commands)

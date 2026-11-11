@@ -68,6 +68,22 @@ fn handle_action_for_library_page(
             ui,
             client_pub,
         ),
+        LibraryFocusState::RecentlyPlayed | LibraryFocusState::RecommendedStations => {
+            window::handle_action_for_selected_item(
+                action,
+                &ui.search_filtered_items(&data.user_data.recently_played_tracks),
+                &data,
+                ui,
+                client_pub,
+            )
+        }
+        LibraryFocusState::TopTracks => window::handle_action_for_selected_item(
+            action,
+            &ui.search_filtered_items(&data.user_data.top_tracks),
+            &data,
+            ui,
+            client_pub,
+        ),
         LibraryFocusState::SavedAlbums => window::handle_action_for_selected_item(
             action,
             &ui.search_filtered_items(&data.user_data.saved_albums),
@@ -170,6 +186,38 @@ fn handle_command_for_library_page(
                 &data,
                 ui,
                 client_pub,
+            )
+        }
+        LibraryFocusState::RecentlyPlayed => {
+            let data = state.data.read();
+            window::handle_command_for_track_list_window(
+                command,
+                client_pub,
+                &ui.search_filtered_items(&data.user_data.recently_played_tracks),
+                &data,
+                ui,
+                state,
+            )
+        }
+        LibraryFocusState::RecommendedStations => {
+            let data = state.data.read();
+            window::handle_command_for_station_list_window(
+                command,
+                client_pub,
+                &ui.search_filtered_items(&data.user_data.recently_played_tracks),
+                &data,
+                ui,
+            )
+        }
+        LibraryFocusState::TopTracks => {
+            let data = state.data.read();
+            window::handle_command_for_track_list_window(
+                command,
+                client_pub,
+                &ui.search_filtered_items(&data.user_data.top_tracks),
+                &data,
+                ui,
+                state,
             )
         }
         LibraryFocusState::SavedAlbums => {

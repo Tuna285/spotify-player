@@ -37,6 +37,7 @@ pub enum ClientRequest {
     AddAlbumToQueue(AlbumId<'static>),
     AddPlaylistToQueue(PlaylistId<'static>),
     AddTracksToQueue(Vec<TrackId<'static>>),
+    AddRadioToQueue(String),
     AddPlayableToPlaylist(PlaylistId<'static>, PlayableId<'static>),
     DeleteTrackFromPlaylist(PlaylistId<'static>, TrackId<'static>),
     ReorderPlaylistItems {

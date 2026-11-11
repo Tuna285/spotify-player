@@ -23,6 +23,8 @@ pub enum FileCacheKey {
     SavedShows,
     SavedAlbums,
     SavedTracks,
+    RecentlyPlayedTracks,
+    TopTracks,
     ContextSortOrders,
 }
 
@@ -47,6 +49,8 @@ pub struct UserData {
     pub saved_shows: Vec<Show>,
     pub saved_albums: Vec<Album>,
     pub saved_tracks: HashMap<String, Track>,
+    pub recently_played_tracks: Vec<Track>,
+    pub top_tracks: Vec<Track>,
     pub context_sort_orders: HashMap<String, ContextSortState>,
 }
 
@@ -200,6 +204,13 @@ impl UserData {
             saved_albums: load_data_from_file_cache(FileCacheKey::SavedAlbums, cache_folder)
                 .unwrap_or_default(),
             saved_tracks: load_data_from_file_cache(FileCacheKey::SavedTracks, cache_folder)
+                .unwrap_or_default(),
+            recently_played_tracks: load_data_from_file_cache(
+                FileCacheKey::RecentlyPlayedTracks,
+                cache_folder,
+            )
+            .unwrap_or_default(),
+            top_tracks: load_data_from_file_cache(FileCacheKey::TopTracks, cache_folder)
                 .unwrap_or_default(),
             context_sort_orders: load_data_from_file_cache(
                 FileCacheKey::ContextSortOrders,

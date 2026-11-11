@@ -5,9 +5,10 @@ use librespot_core::authentication::Credentials;
 use librespot_core::config::DeviceType;
 use librespot_core::{spotify_uri, Session, SpotifyUri};
 use librespot_playback::audio_backend::Sink;
+#[cfg(not(feature = "rodio-backend"))]
+use librespot_playback::audio_backend;
 use librespot_playback::mixer::MixerConfig;
 use librespot_playback::{
-    audio_backend,
     config::{AudioFormat, Bitrate, PlayerConfig},
     mixer::{self, Mixer},
     player,
@@ -16,6 +17,193 @@ use rspotify::model::{EpisodeId, Id, PlayableId, TrackId};
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+#[cfg(feature = "rodio-backend")]
+use cpal::traits::{DeviceTrait, HostTrait};
+#[cfg(feature = "rodio-backend")]
+use librespot_playback::{
+    audio_backend::{SinkError, SinkResult},
+    convert::Converter,
+    decoder::AudioPacket,
+    NUM_CHANNELS, SAMPLE_RATE,
+};
+
+#[cfg(feature = "rodio-backend")]
+struct HotSwapRodioSink {
+    host: cpal::Host,
+    format: AudioFormat,
+    current_device_name: Option<String>,
+    active: Option<(rodio::Sink, rodio::OutputStream)>,
+    last_device_check: std::time::Instant,
+    is_playing: bool,
+}
+
+#[cfg(feature = "rodio-backend")]
+impl HotSwapRodioSink {
+    fn new(format: AudioFormat) -> Self {
+        let mut s = Self {
+            host: cpal::default_host(),
+            format,
+            current_device_name: None,
+            active: None,
+            last_device_check: std::time::Instant::now(),
+            is_playing: false,
+        };
+        s.open_default_device();
+        s
+    }
+
+    fn open_default_device(&mut self) -> bool {
+        let Some(cpal_device) = self.host.default_output_device() else {
+            return false;
+        };
+        let name = cpal_device.name().ok();
+        let Ok(default_config) = cpal_device.default_output_config() else {
+            return false;
+        };
+        let config = cpal_device
+            .supported_output_configs()
+            .ok()
+            .and_then(|mut cfgs| {
+                cfgs.find(|c| c.channels() == NUM_CHANNELS as cpal::ChannelCount)
+                    .and_then(|c| {
+                        c.try_with_sample_rate(cpal::SampleRate(SAMPLE_RATE))
+                            .or_else(|| c.try_with_sample_rate(default_config.sample_rate()))
+                    })
+            })
+            .unwrap_or(default_config);
+
+        let sample_format = match self.format {
+            AudioFormat::F64 => cpal::SampleFormat::F64,
+            AudioFormat::F32 => cpal::SampleFormat::F32,
+            AudioFormat::S32 => cpal::SampleFormat::I32,
+            AudioFormat::S24 | AudioFormat::S24_3 => cpal::SampleFormat::I24,
+            AudioFormat::S16 => cpal::SampleFormat::I16,
+        };
+
+        let stream_res = rodio::OutputStreamBuilder::default()
+            .with_device(cpal_device.clone())
+            .with_config(&config.config())
+            .with_sample_format(sample_format)
+            .open_stream()
+            .or_else(|_| {
+                rodio::OutputStreamBuilder::from_device(cpal_device)
+                    .and_then(|b| b.open_stream_or_fallback())
+            });
+        let Ok(mut stream) = stream_res else {
+            return false;
+        };
+        stream.log_on_drop(false);
+        let sink = rodio::Sink::connect_new(stream.mixer());
+        if self.is_playing {
+            sink.play();
+        } else {
+            sink.pause();
+        }
+        tracing::info!(
+            "Using audio output device: {}",
+            name.as_deref().unwrap_or("[unknown]")
+        );
+        self.current_device_name = name;
+        self.active = Some((sink, stream));
+        true
+    }
+
+    fn check_device_change(&mut self) {
+        if self.last_device_check.elapsed() >= std::time::Duration::from_millis(800) {
+            self.last_device_check = std::time::Instant::now();
+            let new_name = self
+                .host
+                .default_output_device()
+                .and_then(|d| d.name().ok());
+            if new_name.is_some() && new_name != self.current_device_name {
+                tracing::info!(
+                    "Default audio output device changed ({:?} -> {:?}), switching stream...",
+                    self.current_device_name,
+                    new_name
+                );
+                self.active = None;
+                self.open_default_device();
+            }
+        }
+    }
+}
+
+#[cfg(feature = "rodio-backend")]
+impl Sink for HotSwapRodioSink {
+    fn start(&mut self) -> SinkResult<()> {
+        self.is_playing = true;
+        self.check_device_change();
+        if self.active.is_none() {
+            self.open_default_device();
+        }
+        if let Some((ref sink, _)) = self.active {
+            sink.play();
+        }
+        Ok(())
+    }
+
+    fn stop(&mut self) -> SinkResult<()> {
+        self.is_playing = false;
+        if let Some((ref sink, _)) = self.active {
+            sink.clear();
+            sink.pause();
+        }
+        Ok(())
+    }
+
+    fn write(&mut self, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
+        self.check_device_change();
+        if self.active.is_none() {
+            self.open_default_device();
+        }
+        let samples = match packet.samples() {
+            Ok(s) => s,
+            Err(e) => return Err(SinkError::OnWrite(e.to_string())),
+        };
+        let samples_f32: &[f32] = &converter.f64_to_f32(samples);
+
+        let mut stalled = false;
+        if let Some((ref sink, _)) = self.active {
+            let source = rodio::buffer::SamplesBuffer::new(
+                NUM_CHANNELS as cpal::ChannelCount,
+                SAMPLE_RATE,
+                samples_f32,
+            );
+            sink.append(source);
+
+            let mut prev_len = sink.len();
+            let mut stall_ticks = 0usize;
+            while sink.len() > 26 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                let curr_len = sink.len();
+                if curr_len >= prev_len {
+                    stall_ticks += 1;
+                    if stall_ticks >= 15 {
+                        stalled = true;
+                        break;
+                    }
+                } else {
+                    prev_len = curr_len;
+                    stall_ticks = 0;
+                }
+            }
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        if stalled {
+            tracing::warn!(
+                "Audio output stream stalled on {:?}, reconnecting to current default audio device...",
+                self.current_device_name
+            );
+            self.active = None;
+            self.open_default_device();
+        }
+
+        Ok(())
+    }
+}
 
 /// Whether the next streaming connection is the first one of the process.
 ///
@@ -181,6 +369,7 @@ pub async fn new_connection(
     );
     mixer.set_volume(volume);
 
+    #[cfg(not(feature = "rodio-backend"))]
     let backend = audio_backend::find(None).expect("should be able to find an audio backend");
     let player_config = PlayerConfig {
         bitrate: device
@@ -206,6 +395,9 @@ pub async fn new_connection(
             session.clone(),
             mixer.get_soft_volume(),
             move || -> Box<dyn Sink> {
+                #[cfg(feature = "rodio-backend")]
+                let real: Box<dyn Sink> = Box::new(HotSwapRodioSink::new(AudioFormat::default()));
+                #[cfg(not(feature = "rodio-backend"))]
                 let real = backend(None, AudioFormat::default());
                 if let Some(ref bands) = vis_bands {
                     Box::new(crate::ui::streaming::VisualizationSink::new(
