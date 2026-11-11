@@ -117,7 +117,7 @@ fzf = ["fuzzy-matcher"]
 rustls-tls = ["reqwest/default-tls"]
 native-tls = ["reqwest/native-tls"]
 
-default = ["rodio-backend", "media-control", "rustls-tls"]
+default = ["rodio-backend", "media-control", "rustls-tls", "image", "pixelate"]
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }{ archive-suffix }"
