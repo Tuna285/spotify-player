@@ -288,12 +288,30 @@ impl UserData {
             .collect()
     }
 
-    /// Prepend an item into `recently_played_items`, deduplicating by key and capping at 50 entries
+    /// Prepend an item into `recently_played_items`, deduplicating by key and capping at 30 entries
     pub fn push_recent_item(&mut self, item: RecentItem) {
         let key = item.cache_key();
         self.recently_played_items.retain(|i| i.cache_key() != key);
         self.recently_played_items.insert(0, item);
-        self.recently_played_items.truncate(50);
+        self.recently_played_items.truncate(30);
+    }
+
+    /// Merge newly fetched recent items in front of previously cached items, deduplicated by key
+    pub fn merge_recent_items(&mut self, incoming: Vec<RecentItem>) {
+        let mut seen = HashSet::new();
+        let mut merged = Vec::new();
+        for item in incoming
+            .into_iter()
+            .chain(std::mem::take(&mut self.recently_played_items))
+        {
+            if seen.insert(item.cache_key()) {
+                merged.push(item);
+                if merged.len() >= 30 {
+                    break;
+                }
+            }
+        }
+        self.recently_played_items = merged;
     }
 
     /// Build diverse Recommended Stations from the user's favorite artists and top/liked tracks
@@ -652,5 +670,15 @@ mod tests {
         )));
         assert_eq!(user_data.recently_played_items.len(), 2);
         assert!(matches!(user_data.recently_played_items[0], RecentItem::Track(_)));
+
+        user_data.merge_recent_items(vec![RecentItem::Artist(make_artist(
+            "4dpARuAgO514xM91t6iY44",
+            "NewArtist",
+        ))]);
+        assert_eq!(user_data.recently_played_items.len(), 3);
+        assert!(matches!(
+            &user_data.recently_played_items[0],
+            RecentItem::Artist(a) if a.name == "NewArtist"
+        ));
     }
 }

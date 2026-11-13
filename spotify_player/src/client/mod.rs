@@ -659,17 +659,20 @@ impl AppClient {
                                     .context(
                                         "store user's recently played tracks into the cache folder",
                                     )?;
+                                    let merged_items = {
+                                        let mut data = state.data.write();
+                                        data.user_data.recently_played_tracks = tracks.clone();
+                                        data.user_data.merge_recent_items(recent_items);
+                                        data.user_data.recently_played_items.clone()
+                                    };
                                     store_data_into_file_cache(
                                         FileCacheKey::RecentlyPlayedItems,
                                         cache_folder,
-                                        &recent_items,
+                                        &merged_items,
                                     )
                                     .context(
                                         "store user's recently played items into the cache folder",
                                     )?;
-                                    let mut data = state.data.write();
-                                    data.user_data.recently_played_tracks = tracks.clone();
-                                    data.user_data.recently_played_items = recent_items;
                                     Context::Tracks {
                                         tracks,
                                         desc: "User's recently played tracks".to_string(),
@@ -2246,6 +2249,15 @@ impl AppClient {
                     _ => RecentItem::Track(track),
                 };
                 data.user_data.push_recent_item(recent_item);
+                let cached_items = data.user_data.recently_played_items.clone();
+                drop(data);
+                if let Err(err) = store_data_into_file_cache(
+                    FileCacheKey::RecentlyPlayedItems,
+                    &configs.cache_folder,
+                    &cached_items,
+                ) {
+                    tracing::warn!("Failed to store recently played items cache: {err:#}");
+                }
             }
         }
         let curr_artist = match &curr_item {

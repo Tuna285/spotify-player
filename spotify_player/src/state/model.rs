@@ -639,6 +639,8 @@ impl Playlist {
             || name == "repeat rewind"
             || name == "your time capsule"
             || name.starts_with("your top songs")
+            || name.starts_with("your all-time")
+            || name.ends_with(" mix")
     }
 }
 
@@ -876,7 +878,13 @@ impl RecentItem {
 impl std::fmt::Display for RecentItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Playlist(p) => write!(f, "[Playlist] {}", p.name),
+            Self::Playlist(p) => {
+                if p.owner.1.id() == "spotify" && p.name.ends_with(" Radio") {
+                    write!(f, "[Radio] {}", p.name.trim_end_matches(" Radio"))
+                } else {
+                    write!(f, "[Playlist] {}", p.name)
+                }
+            }
             Self::Album(a) => write!(
                 f,
                 "[Album] {} • {}",
