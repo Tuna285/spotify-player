@@ -53,11 +53,10 @@ pub enum PageType {
 #[derive(Clone, Debug, PartialEq)]
 pub struct LibraryPageUIState {
     pub playlist_list: ListState,
+    pub made_for_you_list: ListState,
     pub recently_played_list: ListState,
-    pub recommended_station_list: ListState,
     pub top_track_list: ListState,
-    pub saved_album_list: ListState,
-    pub followed_artist_list: ListState,
+    pub recommended_station_list: ListState,
     pub focus: LibraryFocusState,
     pub playlist_folder_id: usize,
 }
@@ -105,11 +104,10 @@ pub enum ContextPageUIState {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum LibraryFocusState {
     Playlists,
+    MadeForYou,
     RecentlyPlayed,
-    RecommendedStations,
     TopTracks,
-    SavedAlbums,
-    FollowedArtists,
+    RecommendedStations,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -183,26 +181,22 @@ impl PageState {
                 state:
                     LibraryPageUIState {
                         playlist_list,
+                        made_for_you_list,
                         recently_played_list,
-                        recommended_station_list,
                         top_track_list,
-                        saved_album_list,
-                        followed_artist_list,
+                        recommended_station_list,
                         focus,
                         ..
                     },
             } => Some(match focus {
                 LibraryFocusState::Playlists => MutableWindowState::List(playlist_list),
+                LibraryFocusState::MadeForYou => MutableWindowState::List(made_for_you_list),
                 LibraryFocusState::RecentlyPlayed => {
                     MutableWindowState::List(recently_played_list)
                 }
+                LibraryFocusState::TopTracks => MutableWindowState::List(top_track_list),
                 LibraryFocusState::RecommendedStations => {
                     MutableWindowState::List(recommended_station_list)
-                }
-                LibraryFocusState::TopTracks => MutableWindowState::List(top_track_list),
-                LibraryFocusState::SavedAlbums => MutableWindowState::List(saved_album_list),
-                LibraryFocusState::FollowedArtists => {
-                    MutableWindowState::List(followed_artist_list)
                 }
             }),
             Self::Search {
@@ -268,11 +262,10 @@ impl LibraryPageUIState {
     pub fn new() -> Self {
         Self {
             playlist_list: ListState::default(),
+            made_for_you_list: ListState::default(),
             recently_played_list: ListState::default(),
-            recommended_station_list: ListState::default(),
             top_track_list: ListState::default(),
-            saved_album_list: ListState::default(),
-            followed_artist_list: ListState::default(),
+            recommended_station_list: ListState::default(),
             focus: LibraryFocusState::Playlists,
             playlist_folder_id: 0,
         }
@@ -443,10 +436,9 @@ impl_focusable!(
     LibraryFocusState,
     [Playlists, RecentlyPlayed],
     [RecentlyPlayed, RecommendedStations],
-    [RecommendedStations, TopTracks],
-    [TopTracks, SavedAlbums],
-    [SavedAlbums, FollowedArtists],
-    [FollowedArtists, Playlists]
+    [RecommendedStations, MadeForYou],
+    [MadeForYou, TopTracks],
+    [TopTracks, Playlists]
 );
 
 impl_focusable!(

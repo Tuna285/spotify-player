@@ -624,6 +624,24 @@ impl From<rspotify::model::FullPlaylist> for Playlist {
     }
 }
 
+impl Playlist {
+    /// Returns true if this playlist is a personalized Spotify "Made For You" mix.
+    pub fn is_made_for_you(&self) -> bool {
+        if self.owner.1.id() != "spotify" {
+            return false;
+        }
+        let name = self.name.to_lowercase();
+        name.starts_with("daily mix")
+            || name == "discover weekly"
+            || name == "release radar"
+            || name == "daylist"
+            || name == "on repeat"
+            || name == "repeat rewind"
+            || name == "your time capsule"
+            || name.starts_with("your top songs")
+    }
+}
+
 impl std::fmt::Display for Playlist {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} • {}", self.name, self.owner.0)
@@ -812,3 +830,107 @@ impl From<librespot_metadata::lyrics::Lyrics> for Lyrics {
         Self { lines }
     }
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+/// An item displayed in the Library page's Recently Played panel.
+pub enum RecentItem {
+    Playlist(Playlist),
+    Album(Album),
+    Artist(Artist),
+    Radio {
+        seed_uri: String,
+        title: String,
+        subtitle: Option<String>,
+    },
+    Track(Track),
+}
+
+impl RecentItem {
+    pub fn cache_key(&self) -> String {
+        match self {
+            Self::Playlist(p) => p.id.uri(),
+            Self::Album(a) => a.id.uri(),
+            Self::Artist(a) => a.id.uri(),
+            Self::Radio { seed_uri, .. } => format!("radio:{seed_uri}"),
+            Self::Track(t) => t.id.uri(),
+        }
+    }
+
+    pub fn matches_playback(
+        &self,
+        curr_context_uri: Option<&str>,
+        curr_track_uri: Option<&str>,
+    ) -> bool {
+        match self {
+            Self::Playlist(p) => curr_context_uri == Some(p.id.uri().as_str()),
+            Self::Album(a) => curr_context_uri == Some(a.id.uri().as_str()),
+            Self::Artist(a) => curr_context_uri == Some(a.id.uri().as_str()),
+            Self::Radio { seed_uri, .. } => {
+                curr_context_uri == Some(format!("radio:{seed_uri}").as_str())
+            }
+            Self::Track(t) => curr_track_uri == Some(t.id.uri().as_str()),
+        }
+    }
+}
+
+impl std::fmt::Display for RecentItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Playlist(p) => write!(f, "[Playlist] {}", p.name),
+            Self::Album(a) => write!(
+                f,
+                "[Album] {} • {}",
+                a.name,
+                map_join(&a.artists, |ar| &ar.name, ", ")
+            ),
+            Self::Artist(a) => write!(f, "[Artist] {}", a.name),
+            Self::Radio {
+                title, subtitle, ..
+            } => match subtitle {
+                Some(sub) => write!(f, "[Radio] {title} • {sub}"),
+                None => write!(f, "[Radio] {title}"),
+            },
+            Self::Track(t) => write!(f, "[Track] {} • {}", t.display_name(), t.artists_info()),
+        }
+    }
+}
+
+impl BidiDisplay for RecentItem {}
+
+#[derive(Clone, Debug)]
+/// A radio station recommendation seeded by either a favorite artist or a favorite track.
+pub enum StationItem {
+    Artist(Artist),
+    Track(Track),
+}
+
+impl StationItem {
+    pub fn seed_uri(&self) -> String {
+        match self {
+            Self::Artist(a) => a.id.uri(),
+            Self::Track(t) => t.id.uri(),
+        }
+    }
+
+    pub fn seed_name(&self) -> &str {
+        match self {
+            Self::Artist(a) => &a.name,
+            Self::Track(t) => &t.name,
+        }
+    }
+
+    pub fn radio_uri(&self) -> String {
+        format!("radio:{}", self.seed_uri())
+    }
+}
+
+impl std::fmt::Display for StationItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Artist(a) => write!(f, "{} Radio", a.name),
+            Self::Track(t) => write!(f, "{} Radio • {}", t.display_name(), t.artists_info()),
+        }
+    }
+}
+
+impl BidiDisplay for StationItem {}

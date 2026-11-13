@@ -479,77 +479,88 @@ pub fn render_library_page(
         _ => return,
     };
 
-    // 2. Construct the 2-tier dashboard layout:
-    // Top row (50%):    [Playlists | Recently Played | Recommended Stations]
-    // Bottom row (50%): [Top Tracks | Albums | Artists]
-    let rows = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(rect);
-    let col_constraints = [
-        Constraint::Ratio(1, 3),
-        Constraint::Ratio(1, 3),
-        Constraint::Ratio(1, 3),
-    ];
-    let top_chunks = ui.orientation.layout(col_constraints).split(rows[0]);
-    let bot_chunks = ui.orientation.layout(col_constraints).split(rows[1]);
-
-    let border_for = |col: usize| match ui.orientation {
-        Orientation::Horizontal => {
-            if col == 2 {
-                Borders::ALL
-            } else {
-                Borders::TOP | Borders::LEFT | Borders::BOTTOM
+    // 2. Construct the 5-panel asymmetric grid layout with shared single-line borders:
+    // Col 1 (24%): Playlists (top) / Made For You (bottom)
+    // Col 2 (38%): Recently Played (top) / Top Tracks (bottom)
+    // Col 3 (38%): Recommended Stations (full height)
+    let (playlist_chunk, made_chunk, recent_chunk, top_chunk, station_chunk, is_horizontal) =
+        match ui.orientation {
+            Orientation::Horizontal => {
+                let cols = Layout::horizontal([
+                    Constraint::Percentage(24),
+                    Constraint::Percentage(38),
+                    Constraint::Percentage(38),
+                ])
+                .split(rect);
+                let left_rows =
+                    Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(cols[0]);
+                let mid_rows =
+                    Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(cols[1]);
+                (
+                    left_rows[0],
+                    left_rows[1],
+                    mid_rows[0],
+                    mid_rows[1],
+                    cols[2],
+                    true,
+                )
             }
-        }
-        Orientation::Vertical => Borders::ALL,
+            Orientation::Vertical => {
+                let chunks = Layout::vertical([Constraint::Ratio(1, 5); 5]).split(rect);
+                (chunks[0], chunks[1], chunks[2], chunks[3], chunks[4], false)
+            }
+        };
+
+    let top_cell_borders = if is_horizontal {
+        Borders::TOP | Borders::LEFT
+    } else {
+        Borders::ALL
+    };
+    let bot_cell_borders = if is_horizontal {
+        Borders::TOP | Borders::LEFT | Borders::BOTTOM
+    } else {
+        Borders::ALL
     };
 
-    let playlist_rect = construct_and_render_block(
-        "Playlists",
-        &ui.theme,
-        border_for(0),
-        frame,
-        top_chunks[0],
-    );
+    let playlist_rect =
+        construct_and_render_block("Playlists", &ui.theme, top_cell_borders, frame, playlist_chunk);
+    let made_rect =
+        construct_and_render_block("Made For You", &ui.theme, bot_cell_borders, frame, made_chunk);
     let recent_rect = construct_and_render_block(
         "Recently Played",
         &ui.theme,
-        border_for(1),
+        top_cell_borders,
         frame,
-        top_chunks[1],
+        recent_chunk,
     );
+    let top_track_rect =
+        construct_and_render_block("Top Tracks", &ui.theme, bot_cell_borders, frame, top_chunk);
     let station_rect = construct_and_render_block(
         "Recommended Stations",
         &ui.theme,
-        border_for(2),
+        Borders::ALL,
         frame,
-        top_chunks[2],
-    );
-
-    let top_track_rect = construct_and_render_block(
-        "Top Tracks",
-        &ui.theme,
-        border_for(0),
-        frame,
-        bot_chunks[0],
-    );
-    let album_rect = construct_and_render_block(
-        "Albums",
-        &ui.theme,
-        border_for(1),
-        frame,
-        bot_chunks[1],
-    );
-    let artist_rect = construct_and_render_block(
-        "Artists",
-        &ui.theme,
-        border_for(2),
-        frame,
-        bot_chunks[2],
+        station_chunk,
     );
 
     // 3. Construct the page's widgets
-    // 3.1 Playlists window
-    let items = ui
-        .search_filtered_items(&data.user_data.folder_playlists_items(playlist_folder_id))
+    let selected_if = |target: LibraryFocusState, ui: &mut UIStateGuard| -> Option<usize> {
+        if is_active && focus_state == target {
+            ui.current_page_mut().selected()
+        } else {
+            None
+        }
+    };
+
+    // 3.1 Personal Playlists window
+    let playlist_items = ui
+        .search_filtered_items(
+            &data
+                .user_data
+                .personal_folder_playlists_items(playlist_folder_id),
+        )
         .into_iter()
         .map(|item| match item {
             PlaylistFolderItem::Playlist(p) => {
@@ -558,115 +569,89 @@ pub fn render_library_page(
             PlaylistFolderItem::Folder(f) => (f.to_bidi_string(), false),
         })
         .collect::<Vec<_>>();
+    let playlist_selected = selected_if(LibraryFocusState::Playlists, ui);
+    let (playlist_list, n_playlists) = utils::construct_list_widget(
+        &ui.theme,
+        playlist_items,
+        is_active && focus_state == LibraryFocusState::Playlists,
+        playlist_selected,
+    );
 
-    let is_playlist_active = is_active && focus_state == LibraryFocusState::Playlists;
-    let playlist_selected = if is_playlist_active {
-        ui.current_page_mut().selected()
-    } else {
-        None
-    };
-    let (playlist_list, n_playlists) =
-        utils::construct_list_widget(&ui.theme, items, is_playlist_active, playlist_selected);
+    // 3.2 Made For You window
+    let made_items = ui
+        .search_filtered_items(&data.user_data.made_for_you_playlist_items())
+        .into_iter()
+        .filter_map(|item| match item {
+            PlaylistFolderItem::Playlist(p) => {
+                Some((to_bidi_string(&p.name), curr_context_uri == Some(p.id.uri())))
+            }
+            PlaylistFolderItem::Folder(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let made_selected = selected_if(LibraryFocusState::MadeForYou, ui);
+    let (made_list, n_made) = utils::construct_list_widget(
+        &ui.theme,
+        made_items,
+        is_active && focus_state == LibraryFocusState::MadeForYou,
+        made_selected,
+    );
 
-    // 3.2 Recently Played window
-    let is_recent_active = is_active && focus_state == LibraryFocusState::RecentlyPlayed;
-    let recent_selected = if is_recent_active {
-        ui.current_page_mut().selected()
-    } else {
-        None
-    };
+    // 3.3 Recently Played window (context-grouped like Spotify Desktop)
+    let recent_items = ui
+        .search_filtered_items(&data.user_data.recently_played_items)
+        .into_iter()
+        .map(|item| {
+            (
+                item.to_bidi_string(),
+                item.matches_playback(curr_context_uri.as_deref(), curr_track_uri.as_deref()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let recent_selected = selected_if(LibraryFocusState::RecentlyPlayed, ui);
     let (recent_list, n_recent) = utils::construct_list_widget(
         &ui.theme,
-        ui.search_filtered_items(&data.user_data.recently_played_tracks)
-            .into_iter()
-            .map(|t| {
-                (
-                    to_bidi_string(&format!("{} • {}", t.display_name(), t.artists_info())),
-                    curr_track_uri.as_deref() == Some(&t.id.uri()),
-                )
-            })
-            .collect(),
-        is_recent_active,
+        recent_items,
+        is_active && focus_state == LibraryFocusState::RecentlyPlayed,
         recent_selected,
     );
 
-    // 3.3 Recommended Stations (Track Radio from recently played tracks)
-    let is_station_active = is_active && focus_state == LibraryFocusState::RecommendedStations;
-    let station_selected = if is_station_active {
-        ui.current_page_mut().selected()
-    } else {
-        None
-    };
-    let (station_list, n_stations) = utils::construct_list_widget(
-        &ui.theme,
-        ui.search_filtered_items(&data.user_data.recently_played_tracks)
-            .into_iter()
-            .map(|t| {
-                let radio_uri = format!("radio:{}", t.id.uri());
-                (
-                    to_bidi_string(&format!("{} Radio • {}", t.name, t.artists_info())),
-                    curr_context_uri.as_deref() == Some(&radio_uri),
-                )
-            })
-            .collect(),
-        is_station_active,
-        station_selected,
-    );
-
     // 3.4 Top Tracks window
-    let is_top_active = is_active && focus_state == LibraryFocusState::TopTracks;
-    let top_selected = if is_top_active {
-        ui.current_page_mut().selected()
-    } else {
-        None
-    };
+    let top_track_items = ui
+        .search_filtered_items(&data.user_data.top_tracks)
+        .into_iter()
+        .map(|t| {
+            (
+                to_bidi_string(&format!("{} • {}", t.display_name(), t.artists_info())),
+                curr_track_uri.as_deref() == Some(&t.id.uri()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let top_selected = selected_if(LibraryFocusState::TopTracks, ui);
     let (top_track_list, n_top_tracks) = utils::construct_list_widget(
         &ui.theme,
-        ui.search_filtered_items(&data.user_data.top_tracks)
-            .into_iter()
-            .map(|t| {
-                (
-                    to_bidi_string(&format!("{} • {}", t.display_name(), t.artists_info())),
-                    curr_track_uri.as_deref() == Some(&t.id.uri()),
-                )
-            })
-            .collect(),
-        is_top_active,
+        top_track_items,
+        is_active && focus_state == LibraryFocusState::TopTracks,
         top_selected,
     );
 
-    // 3.5 Saved Albums window
-    let is_album_active = is_active && focus_state == LibraryFocusState::SavedAlbums;
-    let album_selected = if is_album_active {
-        ui.current_page_mut().selected()
-    } else {
-        None
-    };
-    let (album_list, n_albums) = utils::construct_list_widget(
+    // 3.5 Recommended Stations window (mixed Artist Radio + Track Radio)
+    let all_stations = data.user_data.recommended_stations();
+    let station_items = ui
+        .search_filtered_items(&all_stations)
+        .into_iter()
+        .map(|s| {
+            (
+                s.to_bidi_string(),
+                curr_context_uri.as_deref() == Some(s.radio_uri().as_str()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let station_selected = selected_if(LibraryFocusState::RecommendedStations, ui);
+    let (station_list, n_stations) = utils::construct_list_widget(
         &ui.theme,
-        ui.search_filtered_items(&data.user_data.saved_albums)
-            .into_iter()
-            .map(|a| (a.to_bidi_string(), curr_context_uri == Some(a.id.uri())))
-            .collect(),
-        is_album_active,
-        album_selected,
-    );
-
-    // 3.6 Followed Artists window
-    let is_artist_active = is_active && focus_state == LibraryFocusState::FollowedArtists;
-    let artist_selected = if is_artist_active {
-        ui.current_page_mut().selected()
-    } else {
-        None
-    };
-    let (artist_list, n_artists) = utils::construct_list_widget(
-        &ui.theme,
-        ui.search_filtered_items(&data.user_data.followed_artists)
-            .into_iter()
-            .map(|a| (a.to_bidi_string(), curr_context_uri == Some(a.id.uri())))
-            .collect(),
-        is_artist_active,
-        artist_selected,
+        station_items,
+        is_active && focus_state == LibraryFocusState::RecommendedStations,
+        station_selected,
     );
 
     // 4. Render the page's widgets
@@ -683,17 +668,17 @@ pub fn render_library_page(
     );
     utils::render_list_window(
         frame,
+        made_list,
+        made_rect,
+        n_made,
+        &mut page_state.made_for_you_list,
+    );
+    utils::render_list_window(
+        frame,
         recent_list,
         recent_rect,
         n_recent,
         &mut page_state.recently_played_list,
-    );
-    utils::render_list_window(
-        frame,
-        station_list,
-        station_rect,
-        n_stations,
-        &mut page_state.recommended_station_list,
     );
     utils::render_list_window(
         frame,
@@ -704,17 +689,10 @@ pub fn render_library_page(
     );
     utils::render_list_window(
         frame,
-        album_list,
-        album_rect,
-        n_albums,
-        &mut page_state.saved_album_list,
-    );
-    utils::render_list_window(
-        frame,
-        artist_list,
-        artist_rect,
-        n_artists,
-        &mut page_state.followed_artist_list,
+        station_list,
+        station_rect,
+        n_stations,
+        &mut page_state.recommended_station_list,
     );
 }
 

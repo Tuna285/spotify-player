@@ -60,7 +60,7 @@ fn handle_action_for_library_page(
     match focus_state {
         LibraryFocusState::Playlists => window::handle_action_for_selected_item(
             action,
-            &ui.search_filtered_items(&data.user_data.folder_playlists_items(folder_id))
+            &ui.search_filtered_items(&data.user_data.personal_folder_playlists_items(folder_id))
                 .into_iter()
                 .copied()
                 .collect::<Vec<_>>(),
@@ -68,15 +68,23 @@ fn handle_action_for_library_page(
             ui,
             client_pub,
         ),
-        LibraryFocusState::RecentlyPlayed | LibraryFocusState::RecommendedStations => {
-            window::handle_action_for_selected_item(
-                action,
-                &ui.search_filtered_items(&data.user_data.recently_played_tracks),
-                &data,
-                ui,
-                client_pub,
-            )
-        }
+        LibraryFocusState::MadeForYou => window::handle_action_for_selected_item(
+            action,
+            &ui.search_filtered_items(&data.user_data.made_for_you_playlist_items())
+                .into_iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            &data,
+            ui,
+            client_pub,
+        ),
+        LibraryFocusState::RecentlyPlayed => window::handle_action_for_recent_item(
+            action,
+            &ui.search_filtered_items(&data.user_data.recently_played_items),
+            &data,
+            ui,
+            client_pub,
+        ),
         LibraryFocusState::TopTracks => window::handle_action_for_selected_item(
             action,
             &ui.search_filtered_items(&data.user_data.top_tracks),
@@ -84,20 +92,16 @@ fn handle_action_for_library_page(
             ui,
             client_pub,
         ),
-        LibraryFocusState::SavedAlbums => window::handle_action_for_selected_item(
-            action,
-            &ui.search_filtered_items(&data.user_data.saved_albums),
-            &data,
-            ui,
-            client_pub,
-        ),
-        LibraryFocusState::FollowedArtists => window::handle_action_for_selected_item(
-            action,
-            &ui.search_filtered_items(&data.user_data.followed_artists),
-            &data,
-            ui,
-            client_pub,
-        ),
+        LibraryFocusState::RecommendedStations => {
+            let stations = data.user_data.recommended_stations();
+            window::handle_action_for_station_item(
+                action,
+                &ui.search_filtered_items(&stations),
+                &data,
+                ui,
+                client_pub,
+            )
+        }
     }
 }
 
@@ -179,7 +183,22 @@ fn handle_command_for_library_page(
             let data = state.data.read();
             window::handle_command_for_playlist_list_window(
                 command,
-                &ui.search_filtered_items(&data.user_data.folder_playlists_items(folder_id))
+                &ui.search_filtered_items(
+                    &data.user_data.personal_folder_playlists_items(folder_id),
+                )
+                .into_iter()
+                .copied()
+                .collect::<Vec<_>>(),
+                &data,
+                ui,
+                client_pub,
+            )
+        }
+        LibraryFocusState::MadeForYou => {
+            let data = state.data.read();
+            window::handle_command_for_playlist_list_window(
+                command,
+                &ui.search_filtered_items(&data.user_data.made_for_you_playlist_items())
                     .into_iter()
                     .copied()
                     .collect::<Vec<_>>(),
@@ -190,23 +209,13 @@ fn handle_command_for_library_page(
         }
         LibraryFocusState::RecentlyPlayed => {
             let data = state.data.read();
-            window::handle_command_for_track_list_window(
+            window::handle_command_for_recent_item_list_window(
                 command,
                 client_pub,
-                &ui.search_filtered_items(&data.user_data.recently_played_tracks),
+                &ui.search_filtered_items(&data.user_data.recently_played_items),
                 &data,
                 ui,
                 state,
-            )
-        }
-        LibraryFocusState::RecommendedStations => {
-            let data = state.data.read();
-            window::handle_command_for_station_list_window(
-                command,
-                client_pub,
-                &ui.search_filtered_items(&data.user_data.recently_played_tracks),
-                &data,
-                ui,
             )
         }
         LibraryFocusState::TopTracks => {
@@ -220,26 +229,16 @@ fn handle_command_for_library_page(
                 state,
             )
         }
-        LibraryFocusState::SavedAlbums => {
-            // Use a read lock for the function call
+        LibraryFocusState::RecommendedStations => {
             let data = state.data.read();
-            window::handle_command_for_album_list_window(
+            let stations = data.user_data.recommended_stations();
+            window::handle_command_for_station_list_window(
                 command,
-                &ui.search_filtered_items(&data.user_data.saved_albums),
-                &data,
-                ui,
                 client_pub,
-            )
-        }
-        LibraryFocusState::FollowedArtists => {
-            // Handle artist-specific commands
-            let data = state.data.read();
-            Ok(window::handle_command_for_artist_list_window(
-                command,
-                &ui.search_filtered_items(&data.user_data.followed_artists),
+                &ui.search_filtered_items(&stations),
                 &data,
                 ui,
-            ))
+            )
         }
     }
 }

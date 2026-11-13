@@ -9,9 +9,9 @@ use crate::{
     state::{
         store_data_into_file_cache, Album, AlbumId, Artist, ArtistId, Category, Context, ContextId,
         Device, FileCacheKey, Item, ItemId, MemoryCaches, Playback, PlaybackMetadata, Playlist,
-        PlaylistFolderItem, PlaylistId, SearchResults, SharedState, Show, ShowId, Track, TrackId,
-        UserId, TTL_CACHE_DURATION, USER_LIKED_TRACKS_URI, USER_RECENTLY_PLAYED_TRACKS_URI,
-        USER_TOP_TRACKS_URI,
+        PlaylistFolderItem, PlaylistId, RecentItem, SearchResults, SharedState, Show, ShowId,
+        Track, TrackId, UserId, TTL_CACHE_DURATION, USER_LIKED_TRACKS_URI,
+        USER_RECENTLY_PLAYED_TRACKS_URI, USER_TOP_TRACKS_URI,
     },
 };
 
@@ -585,6 +585,16 @@ impl AppClient {
                 .context("store user's followed artists into the cache folder")?;
                 state.data.write().user_data.followed_artists = artists;
             }
+            ClientRequest::GetUserTopArtists => {
+                let artists = self.current_user_top_artists().await?;
+                store_data_into_file_cache(
+                    FileCacheKey::TopArtists,
+                    &config::get_config().cache_folder,
+                    &artists,
+                )
+                .context("store user's top artists into the cache folder")?;
+                state.data.write().user_data.top_artists = artists;
+            }
             ClientRequest::GetUserSavedAlbums => {
                 let albums = self.current_user_saved_albums().await?;
                 store_data_into_file_cache(
@@ -638,17 +648,28 @@ impl AppClient {
                                     }
                                 }
                                 USER_RECENTLY_PLAYED_TRACKS_URI => {
-                                    let tracks = self.current_user_recently_played_tracks().await?;
+                                    let (tracks, recent_items) =
+                                        self.current_user_recently_played_data(state).await?;
+                                    let cache_folder = &config::get_config().cache_folder;
                                     store_data_into_file_cache(
                                         FileCacheKey::RecentlyPlayedTracks,
-                                        &config::get_config().cache_folder,
+                                        cache_folder,
                                         &tracks,
                                     )
                                     .context(
                                         "store user's recently played tracks into the cache folder",
                                     )?;
-                                    state.data.write().user_data.recently_played_tracks =
-                                        tracks.clone();
+                                    store_data_into_file_cache(
+                                        FileCacheKey::RecentlyPlayedItems,
+                                        cache_folder,
+                                        &recent_items,
+                                    )
+                                    .context(
+                                        "store user's recently played items into the cache folder",
+                                    )?;
+                                    let mut data = state.data.write();
+                                    data.user_data.recently_played_tracks = tracks.clone();
+                                    data.user_data.recently_played_items = recent_items;
                                     Context::Tracks {
                                         tracks,
                                         desc: "User's recently played tracks".to_string(),
@@ -1025,23 +1046,118 @@ impl AppClient {
             .collect())
     }
 
-    /// Get the recently played tracks of the current user
-    pub async fn current_user_recently_played_tracks(&self) -> Result<Vec<Track>> {
+    /// Resolve a `rspotify::model::PlayHistory` entry into a `RecentItem` (context-grouped if possible)
+    async fn resolve_recent_item(
+        &self,
+        history: &rspotify::model::PlayHistory,
+        track: &Track,
+        state: &SharedState,
+        playlist_cache: &mut HashMap<String, Option<Playlist>>,
+    ) -> RecentItem {
+        let Some(ref ctx) = history.context else {
+            return RecentItem::Track(track.clone());
+        };
+        let uri = crate::utils::parse_uri(&ctx.uri);
+        match ctx._type {
+            rspotify::model::Type::Playlist => {
+                if let Ok(pid) = PlaylistId::from_uri(&uri) {
+                    let existing = state.data.read().user_data.playlists.iter().find_map(|item| {
+                        match item {
+                            PlaylistFolderItem::Playlist(p) if p.id == pid => Some(p.clone()),
+                            _ => None,
+                        }
+                    });
+                    if let Some(p) = existing {
+                        return RecentItem::Playlist(p);
+                    }
+                    if let Some(cached) = playlist_cache.get(uri.as_ref()) {
+                        if let Some(p) = cached {
+                            return RecentItem::Playlist(p.clone());
+                        }
+                    } else {
+                        let fetched = self.playlist(pid.as_ref(), None, None).await.ok().map(Playlist::from);
+                        playlist_cache.insert(uri.into_owned(), fetched.clone());
+                        if let Some(p) = fetched {
+                            return RecentItem::Playlist(p);
+                        }
+                    }
+                }
+            }
+            rspotify::model::Type::Album => {
+                if let Ok(aid) = AlbumId::from_uri(&uri) {
+                    if history.track.album.id.as_ref() == Some(&aid) {
+                        if let Some(album) = Album::try_from_simplified_album(history.track.album.clone()) {
+                            return RecentItem::Album(album);
+                        }
+                    }
+                    if let Some(album) = state
+                        .data
+                        .read()
+                        .user_data
+                        .saved_albums
+                        .iter()
+                        .find(|a| a.id == aid)
+                        .cloned()
+                    {
+                        return RecentItem::Album(album);
+                    }
+                }
+            }
+            rspotify::model::Type::Artist => {
+                if let Ok(aid) = ArtistId::from_uri(&uri) {
+                    if let Some(sa) = history.track.artists.iter().find(|a| a.id.as_ref() == Some(&aid)) {
+                        if let Some(artist) = Artist::try_from_simplified_artist(sa.clone()) {
+                            return RecentItem::Artist(artist);
+                        }
+                    }
+                    if let Some(artist) = state
+                        .data
+                        .read()
+                        .user_data
+                        .followed_artists
+                        .iter()
+                        .find(|a| a.id == aid)
+                        .cloned()
+                    {
+                        return RecentItem::Artist(artist);
+                    }
+                }
+            }
+            _ => {}
+        }
+        RecentItem::Track(track.clone())
+    }
+
+    /// Get both recently played tracks and context-grouped `RecentItem`s in a single API call
+    pub async fn current_user_recently_played_data(
+        &self,
+        state: &SharedState,
+    ) -> Result<(Vec<Track>, Vec<RecentItem>)> {
         let play_histories = self
             .current_user_recently_played(Some(50), None)
             .await?
             .items;
 
-        // de-duplicate the tracks returned from the recently-played API
         let mut tracks = Vec::<Track>::new();
+        let mut recent_items = Vec::<RecentItem>::new();
+        let mut seen_item_keys = HashSet::<String>::new();
+        let mut playlist_cache = HashMap::<String, Option<Playlist>>::new();
+
         for history in play_histories {
-            if !tracks.iter().any(|t| t.name == history.track.name) {
-                if let Some(track) = Track::try_from_full_track(history.track) {
-                    tracks.push(track);
-                }
+            let Some(track) = Track::try_from_full_track(history.track.clone()) else {
+                continue;
+            };
+            if !tracks.iter().any(|t| t.name == track.name) {
+                tracks.push(track.clone());
+            }
+            let recent = self
+                .resolve_recent_item(&history, &track, state, &mut playlist_cache)
+                .await;
+            if seen_item_keys.insert(recent.cache_key()) {
+                recent_items.push(recent);
             }
         }
-        Ok(tracks)
+        Ok((tracks, recent_items))
     }
 
     /// Get the top tracks of the current user
@@ -1059,6 +1175,15 @@ impl AppClient {
             .into_iter()
             .filter_map(Track::try_from_full_track)
             .collect())
+    }
+
+    /// Get the top artists of the current user
+    pub async fn current_user_top_artists(&self) -> Result<Vec<Artist>> {
+        let artists = self
+            .all_paging_items::<rspotify::model::FullArtist>("me/top/artists", 50)
+            .await?;
+
+        Ok(artists.into_iter().map(Artist::from).collect())
     }
 
     /// Get all playlists of the current user
@@ -2047,23 +2172,80 @@ impl AppClient {
     async fn handle_new_playback_event(&self, state: &SharedState) -> Result<()> {
         let configs = config::get_config();
 
-        let curr_item = {
+        let (curr_item, curr_context_id) = {
             let player = state.player.read();
             let Some(track_or_episode) = player.currently_playing() else {
                 return Ok(());
             };
-            track_or_episode.clone()
+            (track_or_episode.clone(), player.playing_context_id())
         };
 
-        // retrieve current artist for genres if not in cache
+        // Update both recently_played_tracks and context-grouped recently_played_items live
         if let rspotify::model::PlayableItem::Track(ref full_track) = curr_item {
             if let Some(track) = Track::try_from_full_track(full_track.clone()) {
                 let mut data = state.data.write();
                 data.user_data
                     .recently_played_tracks
                     .retain(|t| t.id != track.id && t.name != track.name);
-                data.user_data.recently_played_tracks.insert(0, track);
+                data.user_data.recently_played_tracks.insert(0, track.clone());
                 data.user_data.recently_played_tracks.truncate(50);
+
+                let recent_item = match curr_context_id {
+                    Some(ContextId::Playlist(ref pid)) => data
+                        .user_data
+                        .playlists
+                        .iter()
+                        .find_map(|item| match item {
+                            PlaylistFolderItem::Playlist(p) if p.id == *pid => Some(p.clone()),
+                            _ => None,
+                        })
+                        .or_else(|| match data.caches.context.get(&pid.uri()) {
+                            Some(Context::Playlist { playlist, .. }) => Some(playlist.clone()),
+                            _ => None,
+                        })
+                        .map(RecentItem::Playlist)
+                        .unwrap_or_else(|| RecentItem::Track(track.clone())),
+                    Some(ContextId::Album(ref aid)) => data
+                        .user_data
+                        .saved_albums
+                        .iter()
+                        .find(|a| a.id == *aid)
+                        .cloned()
+                        .or_else(|| match data.caches.context.get(&aid.uri()) {
+                            Some(Context::Album { album, .. }) => Some(album.clone()),
+                            _ => None,
+                        })
+                        .or_else(|| Album::try_from_simplified_album(full_track.album.clone()))
+                        .map(RecentItem::Album)
+                        .unwrap_or_else(|| RecentItem::Track(track.clone())),
+                    Some(ContextId::Artist(ref aid)) => data
+                        .user_data
+                        .followed_artists
+                        .iter()
+                        .chain(data.user_data.top_artists.iter())
+                        .find(|a| a.id == *aid)
+                        .cloned()
+                        .or_else(|| {
+                            full_track
+                                .artists
+                                .iter()
+                                .find(|a| a.id.as_ref() == Some(aid))
+                                .and_then(|a| Artist::try_from_simplified_artist(a.clone()))
+                        })
+                        .map(RecentItem::Artist)
+                        .unwrap_or_else(|| RecentItem::Track(track.clone())),
+                    Some(ContextId::Tracks(ref tid)) if tid.uri.starts_with("radio:") => {
+                        let seed_uri = tid.uri["radio:".len()..].to_string();
+                        let title = tid.kind.trim_end_matches(" Radio").to_string();
+                        RecentItem::Radio {
+                            seed_uri,
+                            title,
+                            subtitle: None,
+                        }
+                    }
+                    _ => RecentItem::Track(track),
+                };
+                data.user_data.push_recent_item(recent_item);
             }
         }
         let curr_artist = match &curr_item {

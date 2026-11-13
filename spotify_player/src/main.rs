@@ -120,6 +120,7 @@ async fn start_app(state: &state::SharedState) -> Result<()> {
     client_pub.send(client::ClientRequest::GetCurrentUser)?;
     client_pub.send(client::ClientRequest::GetUserPlaylists)?;
     client_pub.send(client::ClientRequest::GetUserFollowedArtists)?;
+    client_pub.send(client::ClientRequest::GetUserTopArtists)?;
     client_pub.send(client::ClientRequest::GetUserSavedAlbums)?;
     client_pub.send(client::ClientRequest::GetContext(state::ContextId::Tracks(
         state::USER_LIKED_TRACKS_ID.to_owned(),

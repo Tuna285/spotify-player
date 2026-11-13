@@ -6,7 +6,8 @@ use crate::{
         construct_show_actions,
     },
     state::{
-        store_data_into_file_cache, Episode, FileCacheKey, MutableWindowState, Show, UIStateGuard,
+        store_data_into_file_cache, Episode, FileCacheKey, MutableWindowState, RecentItem, Show,
+        StationItem, UIStateGuard,
     },
 };
 use command::Action;
@@ -517,44 +518,193 @@ pub fn handle_command_for_track_list_window(
     Ok(true)
 }
 
+pub fn handle_action_for_station_item(
+    action: Action,
+    items: &[&StationItem],
+    data: &DataReadGuard,
+    ui: &mut UIStateGuard,
+    client_pub: &flume::Sender<ClientRequest>,
+) -> Result<bool> {
+    let id = ui.current_page_mut().selected().unwrap_or_default();
+    let Some(item) = items.get(id) else {
+        return Ok(false);
+    };
+    let ctx = match item {
+        StationItem::Artist(a) => ActionContext::Artist(a.clone()),
+        StationItem::Track(t) => ActionContext::Track(t.clone()),
+    };
+    handle_action_in_context(action, ctx, client_pub, data, ui)
+}
+
+pub fn handle_action_for_recent_item(
+    action: Action,
+    items: &[&RecentItem],
+    data: &DataReadGuard,
+    ui: &mut UIStateGuard,
+    client_pub: &flume::Sender<ClientRequest>,
+) -> Result<bool> {
+    let id = ui.current_page_mut().selected().unwrap_or_default();
+    let Some(item) = items.get(id) else {
+        return Ok(false);
+    };
+    let ctx = match item {
+        RecentItem::Playlist(p) => ActionContext::Playlist(p.clone()),
+        RecentItem::Album(a) => ActionContext::Album(a.clone()),
+        RecentItem::Artist(a) => ActionContext::Artist(a.clone()),
+        RecentItem::Track(t) => ActionContext::Track(t.clone()),
+        RecentItem::Radio { .. } => return Ok(false),
+    };
+    handle_action_in_context(action, ctx, client_pub, data, ui)
+}
+
+fn open_radio_page(
+    seed_uri: String,
+    seed_name: &str,
+    client_pub: &flume::Sender<ClientRequest>,
+    ui: &mut UIStateGuard,
+) -> Result<()> {
+    let title = if seed_name.ends_with(" Radio") {
+        seed_name.to_string()
+    } else {
+        format!("{seed_name} Radio")
+    };
+    let radio_id = TracksId::new(format!("radio:{seed_uri}"), title);
+    ui.new_page(PageState::Context {
+        id: None,
+        context_page_type: ContextPageType::Browsing(ContextId::Tracks(radio_id.clone())),
+        state: None,
+    });
+    client_pub.send(ClientRequest::GetContext(ContextId::Tracks(radio_id)))?;
+    Ok(())
+}
+
 pub fn handle_command_for_station_list_window(
     command: Command,
     client_pub: &flume::Sender<ClientRequest>,
-    tracks: &[&Track],
+    stations: &[&StationItem],
     data: &DataReadGuard,
     ui: &mut UIStateGuard,
 ) -> Result<bool> {
     let id = ui.current_page_mut().selected().unwrap_or_default();
-    if id >= tracks.len() {
+    if id >= stations.len() {
         return Ok(false);
     }
 
     let count = ui.count_prefix;
-    if handle_navigation_command(command, ui.current_page_mut(), id, tracks.len(), count) {
+    if handle_navigation_command(command, ui.current_page_mut(), id, stations.len(), count) {
         return Ok(true);
     }
     match command {
         Command::ChooseSelected => {
-            let seed_uri = tracks[id].id.uri();
-            let seed_name = &tracks[id].name;
-            let radio_id = TracksId::new(format!("radio:{seed_uri}"), format!("{seed_name} Radio"));
-            ui.new_page(PageState::Context {
-                id: None,
-                context_page_type: ContextPageType::Browsing(ContextId::Tracks(radio_id.clone())),
-                state: None,
-            });
-            client_pub.send(ClientRequest::GetContext(ContextId::Tracks(radio_id)))?;
+            open_radio_page(stations[id].seed_uri(), stations[id].seed_name(), client_pub, ui)?;
         }
         Command::ShowActionsOnSelectedItem => {
-            let actions = command::construct_track_actions(tracks[id], data);
+            let action_item = match stations[id] {
+                StationItem::Artist(a) => {
+                    ActionListItem::Artist(a.clone(), construct_artist_actions(a, data))
+                }
+                StationItem::Track(t) => {
+                    ActionListItem::Track(t.clone(), command::construct_track_actions(t, data))
+                }
+            };
             ui.popup = Some(PopupState::ActionList(
-                Box::new(ActionListItem::Track(tracks[id].clone(), actions)),
+                Box::new(action_item),
                 ListState::default(),
             ));
         }
         Command::AddSelectedItemToQueue => {
-            client_pub.send(ClientRequest::AddRadioToQueue(tracks[id].id.uri()))?;
+            client_pub.send(ClientRequest::AddRadioToQueue(stations[id].seed_uri()))?;
         }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+pub fn handle_command_for_recent_item_list_window(
+    command: Command,
+    client_pub: &flume::Sender<ClientRequest>,
+    items: &[&RecentItem],
+    data: &DataReadGuard,
+    ui: &mut UIStateGuard,
+    state: &SharedState,
+) -> Result<bool> {
+    let id = ui.current_page_mut().selected().unwrap_or_default();
+    if id >= items.len() {
+        return Ok(false);
+    }
+
+    let count = ui.count_prefix;
+    if handle_navigation_command(command, ui.current_page_mut(), id, items.len(), count) {
+        return Ok(true);
+    }
+    match command {
+        Command::ChooseSelected => match items[id] {
+            RecentItem::Playlist(p) => ui.new_page(PageState::Context {
+                id: None,
+                context_page_type: ContextPageType::Browsing(ContextId::Playlist(p.id.clone())),
+                state: None,
+            }),
+            RecentItem::Album(a) => ui.new_page(PageState::Context {
+                id: None,
+                context_page_type: ContextPageType::Browsing(ContextId::Album(a.id.clone())),
+                state: None,
+            }),
+            RecentItem::Artist(a) => ui.new_page(PageState::Context {
+                id: None,
+                context_page_type: ContextPageType::Browsing(ContextId::Artist(a.id.clone())),
+                state: None,
+            }),
+            RecentItem::Radio {
+                seed_uri, title, ..
+            } => open_radio_page(seed_uri.clone(), title, client_pub, ui)?,
+            RecentItem::Track(t) => {
+                {
+                    let mut player = state.player.write();
+                    player.currently_playing_tracks_id = None;
+                    player.currently_playing_context_id = None;
+                }
+                client_pub.send(ClientRequest::Player(PlayerRequest::StartPlayback(
+                    Playback::URIs(vec![t.id.clone().into()], None),
+                    None,
+                )))?;
+            }
+        },
+        Command::ShowActionsOnSelectedItem => {
+            let action_item = match items[id] {
+                RecentItem::Playlist(p) => {
+                    ActionListItem::Playlist(p.clone(), construct_playlist_actions(p, data))
+                }
+                RecentItem::Album(a) => {
+                    ActionListItem::Album(a.clone(), construct_album_actions(a, data))
+                }
+                RecentItem::Artist(a) => {
+                    ActionListItem::Artist(a.clone(), construct_artist_actions(a, data))
+                }
+                RecentItem::Track(t) => {
+                    ActionListItem::Track(t.clone(), command::construct_track_actions(t, data))
+                }
+                RecentItem::Radio { .. } => return Ok(false),
+            };
+            ui.popup = Some(PopupState::ActionList(
+                Box::new(action_item),
+                ListState::default(),
+            ));
+        }
+        Command::AddSelectedItemToQueue => match items[id] {
+            RecentItem::Playlist(p) => {
+                client_pub.send(ClientRequest::AddPlaylistToQueue(p.id.clone()))?;
+            }
+            RecentItem::Album(a) => {
+                client_pub.send(ClientRequest::AddAlbumToQueue(a.id.clone()))?;
+            }
+            RecentItem::Radio { seed_uri, .. } => {
+                client_pub.send(ClientRequest::AddRadioToQueue(seed_uri.clone()))?;
+            }
+            RecentItem::Track(t) => {
+                client_pub.send(ClientRequest::AddPlayableToQueue(t.id.clone().into()))?;
+            }
+            RecentItem::Artist(_) => return Ok(false),
+        },
         _ => return Ok(false),
     }
     Ok(true)

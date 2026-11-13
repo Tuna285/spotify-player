@@ -192,6 +192,7 @@ impl Orientation {
         }
     }
 
+    #[allow(dead_code)]
     pub fn layout<I>(self, constraints: I) -> Layout
     where
         I: IntoIterator,
