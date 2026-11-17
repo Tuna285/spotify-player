@@ -405,7 +405,11 @@ impl AppClient {
                 // For some reasons, when starting a new playback, the integrated `spotify_player`
                 // client doesn't respect the initial shuffle state, so we need to manually update the state
                 if let Some(ref playback) = playback {
-                    self.shuffle(playback.shuffle_state, device_id).await?;
+                    if let Err(err) = self.shuffle(playback.shuffle_state, device_id).await {
+                        tracing::warn!(
+                            "Failed to restore shuffle state after starting playback: {err:#}"
+                        );
+                    }
                 }
                 return Ok(None);
             }
@@ -1273,30 +1277,94 @@ impl AppClient {
         Ok(AppClient::process_artist_albums(albums))
     }
 
+    #[cfg(feature = "streaming")]
+    fn start_local_tracks_playback(
+        &self,
+        ids: &[PlayableId<'_>],
+        start_index: u32,
+    ) -> Result<bool> {
+        let stream_conn = self.stream_conn.lock();
+        let Some(spirc) = stream_conn.as_ref() else {
+            return Ok(false);
+        };
+        let track_uris: Vec<String> = ids.iter().map(PlayableId::uri).collect();
+        if track_uris.is_empty() {
+            return Ok(true);
+        }
+        spirc.activate()?;
+        spirc.load(librespot_connect::LoadRequest::from_tracks(
+            track_uris,
+            librespot_connect::LoadRequestOptions {
+                start_playing: true,
+                seek_to: 0,
+                context_options: None,
+                playing_track: Some(librespot_connect::PlayingTrack::Index(start_index)),
+            },
+        ))?;
+        Ok(true)
+    }
+
+    #[cfg(feature = "streaming")]
+    async fn should_use_local_uris_playback(&self, device_id: Option<&str>) -> bool {
+        if self.stream_conn.lock().is_none() {
+            return false;
+        }
+        let integrated_id = self.spotify.session().await.device_id().to_string();
+        if device_id == Some(integrated_id.as_str()) {
+            return true;
+        }
+        if device_id.is_none() {
+            let has_other_active = self.available_devices().await.is_ok_and(|devices| {
+                devices
+                    .into_iter()
+                    .any(|d| d.is_active && d.id.as_deref() != Some(integrated_id.as_str()))
+            });
+            return !has_other_active;
+        }
+        false
+    }
+
     /// Start a playback
     async fn start_playback(&self, playback: Playback, device_id: Option<&str>) -> Result<()> {
         match playback {
-            Playback::Context(id, offset) => match id {
-                ContextId::Album(id) => {
-                    self.start_context_playback(PlayContextId::from(id), device_id, offset, None)
-                        .await?;
+            Playback::Context(id, offset) => {
+                let play_ctx_id: PlayContextId<'static> = match id {
+                    ContextId::Album(id) => PlayContextId::from(id),
+                    ContextId::Artist(id) => PlayContextId::from(id),
+                    ContextId::Playlist(id) => PlayContextId::from(id),
+                    ContextId::Show(id) => PlayContextId::from(id),
+                    ContextId::Tracks(_) => {
+                        anyhow::bail!("`StartPlayback` request for `tracks` context is not supported")
+                    }
+                };
+                if let Err(err) = self
+                    .start_context_playback(play_ctx_id.clone(), device_id, offset.clone(), None)
+                    .await
+                {
+                    #[cfg(feature = "streaming")]
+                    if self.stream_conn.lock().is_some() {
+                        let integrated_id = self.spotify.session().await.device_id().to_string();
+                        if device_id != Some(integrated_id.as_str()) {
+                            tracing::warn!(
+                                "Context playback on device {:?} failed ({err:#}); falling back to integrated player",
+                                device_id
+                            );
+                            if let Some(spirc) = self.stream_conn.lock().as_ref() {
+                                let _ = spirc.activate();
+                            }
+                            self.start_context_playback(
+                                play_ctx_id,
+                                Some(&integrated_id),
+                                offset,
+                                None,
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                    }
+                    return Err(err.into());
                 }
-                ContextId::Artist(id) => {
-                    self.start_context_playback(PlayContextId::from(id), device_id, offset, None)
-                        .await?;
-                }
-                ContextId::Playlist(id) => {
-                    self.start_context_playback(PlayContextId::from(id), device_id, offset, None)
-                        .await?;
-                }
-                ContextId::Show(id) => {
-                    self.start_context_playback(PlayContextId::from(id), device_id, offset, None)
-                        .await?;
-                }
-                ContextId::Tracks(_) => {
-                    anyhow::bail!("`StartPlayback` request for `tracks` context is not supported")
-                }
-            },
+            }
             Playback::URIs(mut ids, offset) => {
                 let configs = config::get_config();
                 if configs.app_config.device.autoplay {
@@ -1341,8 +1409,39 @@ impl AppClient {
                     other => other,
                 };
 
-                self.start_uris_playback(ids, device_id, offset, None)
-                    .await?;
+                #[cfg(feature = "streaming")]
+                let start_index = match &offset {
+                    Some(rspotify::model::Offset::Position(pos)) => {
+                        u32::try_from(pos.num_milliseconds()).unwrap_or(0)
+                    }
+                    _ => 0,
+                };
+
+                // Load URIs directly into local Spirc when targeting the integrated player to
+                // avoid Spotify's spclient.get_context 400/403 failure on bare `uris` playback.
+                #[cfg(feature = "streaming")]
+                if self.should_use_local_uris_playback(device_id).await
+                    && self.start_local_tracks_playback(&ids, start_index)?
+                {
+                    return Ok(());
+                }
+
+                if let Err(err) = self
+                    .start_uris_playback(ids.clone(), device_id, offset, None)
+                    .await
+                {
+                    #[cfg(feature = "streaming")]
+                    {
+                        tracing::warn!(
+                            "External URIs playback on device {:?} failed ({err:#}); falling back to integrated player",
+                            device_id
+                        );
+                        if self.start_local_tracks_playback(&ids, start_index)? {
+                            return Ok(());
+                        }
+                    }
+                    return Err(err.into());
+                }
             }
         }
 
