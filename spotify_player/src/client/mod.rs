@@ -10,7 +10,7 @@ use crate::{
         store_data_into_file_cache, Album, AlbumId, Artist, ArtistId, Category, Context, ContextId,
         Device, FileCacheKey, Item, ItemId, MemoryCaches, Playback, PlaybackMetadata, Playlist,
         PlaylistFolderItem, PlaylistId, RecentItem, SearchResults, SharedState, Show, ShowId,
-        Track, TrackId, UserId, TTL_CACHE_DURATION, USER_LIKED_TRACKS_URI,
+        Track, TrackId, TracksId, UserId, TTL_CACHE_DURATION, USER_LIKED_TRACKS_URI,
         USER_RECENTLY_PLAYED_TRACKS_URI, USER_TOP_TRACKS_URI,
     },
 };
@@ -184,6 +184,31 @@ pub fn new_api_client() -> Result<WebApiClient> {
         .with_ncspot_only_get_endpoints(ncspot_only_get_endpoints))
 }
 
+#[derive(Clone, Debug)]
+struct PlaybackSnapshot {
+    was_playing: bool,
+    was_integrated: bool,
+    current_playable: Option<(PlayableId<'static>, u32)>,
+    queue_ids: Vec<PlayableId<'static>>,
+    context_id: Option<ContextId>,
+    tracks_id: Option<TracksId>,
+    context_override: Option<ContextId>,
+    repeat_state: rspotify::model::RepeatState,
+    shuffle_state: bool,
+}
+
+fn playable_item_to_id(item: &rspotify::model::PlayableItem) -> Option<PlayableId<'static>> {
+    match item {
+        rspotify::model::PlayableItem::Track(t) => {
+            t.id.as_ref().map(|id| PlayableId::Track(id.clone_static()))
+        }
+        rspotify::model::PlayableItem::Episode(e) => {
+            Some(PlayableId::Episode(e.id.clone_static()))
+        }
+        rspotify::model::PlayableItem::Unknown(_) => None,
+    }
+}
+
 impl AppClient {
     /// Construct a new client
     pub async fn new() -> Result<Self> {
@@ -206,19 +231,181 @@ impl AppClient {
         })
     }
 
+    fn capture_playback_snapshot(
+        player: &crate::state::PlayerState,
+        prev_integrated_id: Option<&str>,
+    ) -> PlaybackSnapshot {
+        let bp = player.buffered_playback.as_ref();
+        let was_playing = bp.is_some_and(|p| p.is_playing);
+        let active_device_id = bp
+            .and_then(|p| p.device_id.as_deref())
+            .or_else(|| player.playback.as_ref().and_then(|p| p.device.id.as_deref()));
+        let was_integrated = prev_integrated_id.is_some() && active_device_id == prev_integrated_id;
+
+        let progress_ms = player
+            .playback_progress()
+            .and_then(|d| u32::try_from(d.num_milliseconds().max(0)).ok())
+            .unwrap_or(0);
+        let current_playable = player
+            .currently_playing()
+            .and_then(playable_item_to_id)
+            .map(|id| (id, progress_ms));
+
+        let queue_ids = player
+            .queue
+            .as_ref()
+            .map(|q| q.queue.iter().filter_map(playable_item_to_id).collect())
+            .unwrap_or_default();
+
+        let repeat_state = bp
+            .map(|p| p.repeat_state)
+            .or_else(|| player.playback.as_ref().map(|p| p.repeat_state))
+            .unwrap_or(rspotify::model::RepeatState::Off);
+        let shuffle_state = bp
+            .map(|p| p.shuffle_state)
+            .or_else(|| player.playback.as_ref().map(|p| p.shuffle_state))
+            .unwrap_or(false);
+
+        PlaybackSnapshot {
+            was_playing,
+            was_integrated,
+            current_playable,
+            queue_ids,
+            context_id: player.playing_context_id(),
+            tracks_id: player.currently_playing_tracks_id.clone(),
+            context_override: player.currently_playing_context_id.clone(),
+            repeat_state,
+            shuffle_state,
+        }
+    }
+
+    #[cfg(feature = "streaming")]
+    fn restore_local_playback(&self, state: &SharedState, snapshot: &PlaybackSnapshot) -> Result<()> {
+        let Some((ref current_id, progress_ms)) = snapshot.current_playable else {
+            return Ok(());
+        };
+        let limit = config::get_config().app_config.tracks_playback_limit.max(1);
+        let mut uris = Vec::with_capacity(1 + snapshot.queue_ids.len());
+        uris.push(current_id.uri());
+        for id in snapshot.queue_ids.iter().take(limit.saturating_sub(1)) {
+            uris.push(id.uri());
+        }
+
+        {
+            let mut player = state.player.write();
+            player.currently_playing_tracks_id.clone_from(&snapshot.tracks_id);
+            player.currently_playing_context_id = snapshot
+                .context_override
+                .clone()
+                .or_else(|| {
+                    snapshot
+                        .context_id
+                        .clone()
+                        .filter(|id| !matches!(id, ContextId::Tracks(_)))
+                });
+        }
+
+        let stream_conn = self.stream_conn.lock();
+        let Some(spirc) = stream_conn.as_ref() else {
+            return Ok(());
+        };
+        spirc.activate()?;
+        spirc.load(librespot_connect::LoadRequest::from_tracks(
+            uris,
+            librespot_connect::LoadRequestOptions {
+                start_playing: snapshot.was_playing,
+                seek_to: progress_ms,
+                context_options: Some(librespot_connect::LoadContextOptions::Options(
+                    librespot_connect::Options {
+                        shuffle: snapshot.shuffle_state,
+                        repeat: snapshot.repeat_state == rspotify::model::RepeatState::Context,
+                        repeat_track: snapshot.repeat_state == rspotify::model::RepeatState::Track,
+                    },
+                )),
+                playing_track: Some(librespot_connect::PlayingTrack::Index(0)),
+            },
+        ))?;
+        tracing::info!(
+            "Restored playback locally after session reconnect (queue_len={}, progress_ms={})",
+            snapshot.queue_ids.len(),
+            progress_ms
+        );
+        Ok(())
+    }
+
     /// Initialize the application's playback upon creating a new session or during startup.
     ///
     /// `resume` controls whether playback should be (re)started on the device we connect to.
-    pub fn initialize_playback(&self, state: &SharedState, resume: bool) {
+    fn initialize_playback(
+        &self,
+        state: &SharedState,
+        resume: bool,
+        snapshot: Option<PlaybackSnapshot>,
+    ) {
         tokio::task::spawn({
             let client = self.clone();
             let state = state.clone();
             async move {
-                // The main playback initialization logic is simple:
-                // if there is no playback, connect to an available device
-                //
-                // However, because it takes time for Spotify server to show up new changes,
-                // a retry logic is implemented to ensure the application's state is properly initialized
+                // Reconnecting an active integrated session: restore playback/queue/context directly
+                // without clearing `MemoryCaches` or `buffered_playback` or dropping to `None`.
+                #[cfg(feature = "streaming")]
+                if let Some(ref snap) = snapshot {
+                    if snap.was_integrated && snap.current_playable.is_some() {
+                        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+                        let integrated_id = client.spotify.session().await.device_id().to_string();
+                        let is_web_api = snap.tracks_id.is_some() || snap.context_override.is_some();
+
+                        let mut needs_local_restore = is_web_api;
+                        if !is_web_api {
+                            if client
+                                .transfer_playback(&integrated_id, Some(snap.was_playing))
+                                .await
+                                .is_err()
+                            {
+                                needs_local_restore = true;
+                            } else {
+                                tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                                let playback_ok = client
+                                    .retrieve_current_playback(&state, false)
+                                    .await
+                                    .is_ok();
+                                let queue_empty = client
+                                    .current_user_queue2()
+                                    .await
+                                    .map(|q| {
+                                        let is_empty = q.queue.is_empty();
+                                        state.player.write().queue = Some(q);
+                                        is_empty
+                                    })
+                                    .unwrap_or(true);
+                                let lost_context = state
+                                    .player
+                                    .read()
+                                    .playback
+                                    .as_ref()
+                                    .is_none_or(|p| p.context.is_none() && snap.context_id.is_some());
+                                if !playback_ok
+                                    || lost_context
+                                    || (!snap.queue_ids.is_empty() && queue_empty)
+                                {
+                                    needs_local_restore = true;
+                                }
+                            }
+                        }
+
+                        if needs_local_restore {
+                            if let Err(err) = client.restore_local_playback(&state, snap) {
+                                tracing::warn!(
+                                    "Failed to restore local playback after reconnect: {err:#}"
+                                );
+                            }
+                        }
+                        client.update_playback_non_blocking(&state);
+                        return;
+                    }
+                }
+
+                // Startup or non-integrated connection path
                 let max_retries = 3;
                 for i in 0..max_retries {
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -264,8 +451,9 @@ impl AppClient {
                                     );
                                 }
                             }
-                            // upon new connection, reset the buffered playback
-                            state.player.write().buffered_playback = None;
+                            if snapshot.is_none() {
+                                state.player.write().buffered_playback = None;
+                            }
                             client.update_playback_non_blocking(&state);
                             break;
                         }
@@ -277,18 +465,23 @@ impl AppClient {
 
     /// Create a new client session
     pub async fn new_session(&self, state: Option<&SharedState>, reauth: bool) -> Result<()> {
-        // Capture whether playback was active *before* tearing down any existing streaming
-        // connection. Shutting down the old `librespot` spirc pauses playback Spotify-side
-        // (and a broken session leaves it paused too), so we use this to resume on the new
-        // device rather than reconnecting in a paused state.
-        let was_playing = state.is_some_and(|state| {
-            state
-                .player
-                .read()
-                .buffered_playback
-                .as_ref()
-                .is_some_and(|p| p.is_playing)
+        // Capture playback state *before* tearing down any existing streaming connection so
+        // mid-session reconnects can preserve context, queue, progress, repeat/shuffle, and volume.
+        #[cfg(feature = "streaming")]
+        let prev_integrated_id = if self.stream_conn.lock().is_some() {
+            Some(self.spotify.session().await.device_id().to_string())
+        } else {
+            None
+        };
+        #[cfg(not(feature = "streaming"))]
+        let prev_integrated_id: Option<String> = None;
+
+        let is_reconnect = prev_integrated_id.is_some();
+        let snapshot = state.map(|s| {
+            let player = s.player.read();
+            Self::capture_playback_snapshot(&player, prev_integrated_id.as_deref())
         });
+        let was_playing = snapshot.as_ref().is_some_and(|s| s.was_playing);
 
         let session = self.auth_config.session();
         let creds = auth::get_creds(&self.auth_config, reauth, true).context("get credentials")?;
@@ -322,9 +515,14 @@ impl AppClient {
         }
 
         if let Some(state) = state {
-            // reset the application's caches
-            state.data.write().caches = MemoryCaches::new();
-            self.initialize_playback(state, was_playing);
+            // Preserve loaded contexts, radio lists, lyrics, images, and search results across
+            // mid-session reconnects; only clear stuck in-flight fetch markers.
+            if is_reconnect {
+                state.data.write().caches.loading_contexts.clear();
+            } else {
+                state.data.write().caches = MemoryCaches::new();
+            }
+            self.initialize_playback(state, was_playing, snapshot);
         }
 
         Ok(())
@@ -2669,10 +2867,11 @@ fn move_seed_track_to_front(tracks: &mut Vec<Track>, seed_track: Track) {
 mod tests {
     use super::{
         move_seed_track_to_front, parse_current_playback_response,
-        parse_current_user_queue_response,
+        parse_current_user_queue_response, AppClient,
     };
-    use crate::state::Track;
+    use crate::state::{ContextId, PlaybackMetadata, Track, TracksId};
     use rspotify::model::{PlayableItem, TrackId};
+    use rspotify::prelude::Id;
 
     fn sample_track(id: &'static str, name: &str) -> Track {
         Track {
@@ -2803,5 +3002,118 @@ mod tests {
         ));
         assert_eq!(queue.queue.len(), 1);
         assert!(matches!(queue.queue[0], PlayableItem::Track(_)));
+    }
+
+    #[test]
+    fn capture_playback_snapshot_preserves_queue_context_and_modes() {
+        let playback_json = serde_json::json!({
+            "device": {
+                "id": "integrated-dev-1",
+                "is_active": true,
+                "is_private_session": false,
+                "is_restricted": false,
+                "name": "spotify-player",
+                "type": "Speaker",
+                "volume_percent": 40
+            },
+            "repeat_state": "context",
+            "shuffle_state": true,
+            "context": {
+                "type": "playlist",
+                "href": "https://api.spotify.com/v1/playlists/6ZXsoRtyeBVYjaBkoT0MgM",
+                "external_urls": {},
+                "uri": "spotify:playlist:6ZXsoRtyeBVYjaBkoT0MgM"
+            },
+            "timestamp": 0,
+            "progress_ms": 42000,
+            "is_playing": true,
+            "item": {
+                "album": {
+                    "album_type": "album",
+                    "artists": [],
+                    "external_urls": {},
+                    "href": null,
+                    "id": null,
+                    "images": [],
+                    "name": "Album"
+                },
+                "artists": [],
+                "disc_number": 1,
+                "duration_ms": 200_000,
+                "explicit": false,
+                "external_urls": {},
+                "href": "https://api.spotify.com/v1/tracks/6t7WriKgVszATnrdBKSUAf",
+                "id": "6t7WriKgVszATnrdBKSUAf",
+                "is_local": false,
+                "name": "Current Song",
+                "preview_url": null,
+                "track_number": 1,
+                "type": "track"
+            },
+            "currently_playing_type": "track",
+            "actions": { "disallows": {} }
+        });
+        let queue_track_json = serde_json::json!({
+            "album": {
+                "album_type": "album",
+                "artists": [],
+                "external_urls": {},
+                "href": null,
+                "id": null,
+                "images": [],
+                "name": "Album"
+            },
+            "artists": [],
+            "disc_number": 1,
+            "duration_ms": 180_000,
+            "explicit": false,
+            "external_urls": {},
+            "href": "https://api.spotify.com/v1/tracks/3n3Ppam7vgaVa1iaRUc9Lp",
+            "id": "3n3Ppam7vgaVa1iaRUc9Lp",
+            "is_local": false,
+            "name": "Queued Song",
+            "preview_url": null,
+            "track_number": 2,
+            "type": "track"
+        });
+        let queue_json = serde_json::json!({
+            "currently_playing": queue_track_json.clone(),
+            "queue": [queue_track_json]
+        });
+
+        let playback = parse_current_playback_response(&playback_json.to_string())
+            .unwrap()
+            .unwrap();
+        let queue = parse_current_user_queue_response(&queue_json.to_string()).unwrap();
+
+        let mut player = crate::state::PlayerState {
+            buffered_playback: Some(PlaybackMetadata::from_playback(&playback)),
+            playback: Some(playback),
+            playback_last_updated_time: Some(std::time::Instant::now()),
+            queue: Some(queue),
+            ..Default::default()
+        };
+        player.currently_playing_tracks_id = Some(TracksId::new("radio:seed", "Test Radio"));
+
+        let snap = AppClient::capture_playback_snapshot(&player, Some("integrated-dev-1"));
+        assert!(snap.was_playing);
+        assert!(snap.was_integrated);
+        assert!(snap.shuffle_state);
+        assert_eq!(snap.repeat_state, rspotify::model::RepeatState::Context);
+        assert_eq!(snap.queue_ids.len(), 1);
+        assert_eq!(
+            snap.queue_ids[0].uri(),
+            "spotify:track:3n3Ppam7vgaVa1iaRUc9Lp"
+        );
+        assert_eq!(
+            snap.current_playable.as_ref().map(|(id, _)| id.uri()),
+            Some("spotify:track:6t7WriKgVszATnrdBKSUAf".to_string())
+        );
+        assert!(snap.current_playable.as_ref().is_some_and(|(_, ms)| *ms >= 42_000));
+        assert!(matches!(snap.context_id, Some(ContextId::Playlist(_))));
+        assert!(snap.tracks_id.is_some());
+
+        let external_snap = AppClient::capture_playback_snapshot(&player, Some("other-dev-id"));
+        assert!(!external_snap.was_integrated);
     }
 }

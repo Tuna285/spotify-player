@@ -345,10 +345,25 @@ pub async fn new_connection(
     let configs = config::get_config();
     let device = &configs.app_config.device;
 
-    // `librespot` volume is a u16 number ranging from 0 to 65535,
-    // while a percentage volume value (from 0 to 100) is used for the device configuration.
-    // So we need to convert from one format to another
-    let volume = (f64::from(std::cmp::min(device.volume, 100_u8)) / 100.0 * 65535.0).round() as u16;
+    // Preserve the live player volume across reconnects instead of resetting to config default.
+    let volume_percent = {
+        let player = state.player.read();
+        let bp = player.buffered_playback.as_ref();
+        if bp.is_some_and(|p| p.mute_state.is_some()) {
+            0
+        } else {
+            bp.and_then(|p| p.volume)
+                .or_else(|| {
+                    player
+                        .playback
+                        .as_ref()
+                        .and_then(|p| p.device.volume_percent)
+                })
+                .and_then(|v| u8::try_from(v).ok())
+                .unwrap_or(device.volume)
+        }
+    };
+    let volume = (f64::from(std::cmp::min(volume_percent, 100_u8)) / 100.0 * 65535.0).round() as u16;
 
     let connect_config = ConnectConfig {
         name: device.name.clone(),
